@@ -14,14 +14,18 @@ const io = new Server(server, {
 
 const MAX_SEATS = 17;
 
-// Tự động tính toán tọa độ 17 vị trí hòn đá thiền xoay quanh hồ
+// Tự động tính toán tọa độ 17 vị trí hòn đá thiền xoay quanh hồ theo dạng so le 2 vòng
 let seatsState = [];
 for (let i = 1; i <= MAX_SEATS; i++) {
     const angle = ((i - 1) * 2 * Math.PI) / MAX_SEATS;
+    // Ghế lẻ nằm ở vòng ngoài, ghế chẵn nằm ở vòng trong
+    const radiusX = (i % 2 !== 0) ? 280 : 200;
+    const radiusY = (i % 2 !== 0) ? 140 : 100;
+
     seatsState.push({
         id: i,
-        x: Math.round(220 * Math.cos(angle)),
-        y: Math.round(110 * Math.sin(angle)),
+        x: Math.round(radiusX * Math.cos(angle)),
+        y: Math.round(radiusY * Math.sin(angle)),
         occupiedBy: null
     });
 }
@@ -85,6 +89,14 @@ io.on('connection', (socket) => {
 
             io.emit('seat-state-changed', seatsState);
         }
+    });
+
+    socket.on('admin-control-audio', (audioData) => {
+        currentTrack = {
+            ...audioData,
+            timestamp: Date.now()
+        };
+        io.emit('sync-audio-track', currentTrack);
     });
 
     socket.on('disconnect', () => {
