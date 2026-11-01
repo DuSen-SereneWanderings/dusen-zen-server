@@ -12,18 +12,19 @@ const io = new Server(server, {
     }
 });
 
-const MAX_SEATS = 8;
+const MAX_SEATS = 17;
 
-let seatsState = [
-    { id: 1, x: -140, y: -60, occupiedBy: null },
-    { id: 2, x: 0,    y: -110, occupiedBy: null },
-    { id: 3, x: 140,  y: -60, occupiedBy: null },
-    { id: 4, x: 200,  y: 40,  occupiedBy: null },
-    { id: 5, x: 140,  y: 140, occupiedBy: null },
-    { id: 6, x: 0,    y: 190, occupiedBy: null },
-    { id: 7, x: -140, y: 140, occupiedBy: null },
-    { id: 8, x: -200, y: 40,  occupiedBy: null }
-];
+// Tự động tính toán tọa độ 17 vị trí hòn đá thiền xoay quanh hồ
+let seatsState = [];
+for (let i = 1; i <= MAX_SEATS; i++) {
+    const angle = ((i - 1) * 2 * Math.PI) / MAX_SEATS;
+    seatsState.push({
+        id: i,
+        x: Math.round(220 * Math.cos(angle)),
+        y: Math.round(110 * Math.sin(angle)),
+        occupiedBy: null
+    });
+}
 
 let currentTrack = {
     url: '',
@@ -39,6 +40,7 @@ io.on('connection', (socket) => {
     activeUsers.set(socket.id, { socketId: socket.id, seatId: null, name: 'Lữ khách' });
 
     socket.emit('init-state', {
+        maxSeats: MAX_SEATS,
         seats: seatsState,
         track: currentTrack,
         onlineCount: activeUsers.size
@@ -54,8 +56,12 @@ io.on('connection', (socket) => {
         }
 
         const occupiedCount = seatsState.filter(s => s.occupiedBy !== null).length;
-        socket.emit('entry-granted', {
-            role: occupiedCount < MAX_SEATS ? 'seated' : 'spectator',
+        
+        socket.emit('entry-status-checked', {
+            maxSeats: MAX_SEATS,
+            occupiedCount: occupiedCount,
+            availableSeats: MAX_SEATS - occupiedCount,
+            isFull: occupiedCount >= MAX_SEATS,
             seats: seatsState
         });
     });
@@ -79,14 +85,6 @@ io.on('connection', (socket) => {
 
             io.emit('seat-state-changed', seatsState);
         }
-    });
-
-    socket.on('admin-control-audio', (audioData) => {
-        currentTrack = {
-            ...audioData,
-            timestamp: Date.now()
-        };
-        io.emit('sync-audio-track', currentTrack);
     });
 
     socket.on('disconnect', () => {
