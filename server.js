@@ -15,37 +15,45 @@ const io = new Server(server, {
 const MAX_SEATS = 17;
 let totalHearts = 0;
 
-// Tự động tính toán tọa độ 17 vị trí hòn đá thiền xoay quanh hồ theo dạng so le 2 vòng
-let seatsState = [];
-for (let i = 1; i <= MAX_SEATS; i++) {
-    const angle = ((i - 1) * 2 * Math.PI) / MAX_SEATS;
-    const radiusX = (i % 2 !== 0) ? 280 : 200;
-    const radiusY = (i % 2 !== 0) ? 140 : 100;
-
-    seatsState.push({
-        id: i,
+let seatsState = Array.from({ length: MAX_SEATS }, (_, i) => {
+    const seatId = i + 1;
+    const angle = (i * 2 * Math.PI) / MAX_SEATS;
+    const radiusX = (seatId % 2 !== 0) ? 280 : 200;
+    const radiusY = (seatId % 2 !== 0) ? 140 : 100;
+    return {
+        id: seatId,
         x: Math.round(radiusX * Math.cos(angle)),
         y: Math.round(radiusY * Math.sin(angle)),
         occupiedBy: null
-    });
-}
+    };
+});
 
-// BỘ ĐỒNG BỘ ÂM THANH THỜI GIAN THỰC TOÀN PHÒNG
+// BỘ DỮ LIỆU BÀI HÁT VÀ MASTER CLOCK
 let audioState = {
     playlist: [],
     trackIndex: 0,
     url: '',
     title: 'Chưa chọn bài phát',
-    startTime: Date.now()
+    trackStartTime: Date.now()
 };
 
 let activeUsers = new Map();
 
+// PHÁT XUNG HEARTBEAT MỖI 4 GIÂY ĐỂ ĐỒNG BỘ ÂM THANH TUYỆT ĐỐI TOÀN PHÒNG
+setInterval(() => {
+    if (audioState.url) {
+        io.emit('audio-sync-heartbeat', {
+            trackIndex: audioState.trackIndex,
+            url: audioState.url,
+            title: audioState.title,
+            trackStartTime: audioState.trackStartTime,
+            serverTime: Date.now()
+        });
+    }
+}, 4000);
+
 io.on('connection', (socket) => {
     activeUsers.set(socket.id, { socketId: socket.id, seatId: null, name: 'Lữ khách' });
-
-    // Tính chính xác số giây bài hát đang phát dở tại thời điểm user mới vào phòng
-    const elapsedSeconds = audioState.url ? (Date.now() - audioState.startTime) / 1000 : 0;
 
     socket.emit('init-state', {
         maxSeats: MAX_SEATS,
@@ -56,34 +64,36 @@ io.on('connection', (socket) => {
             url: audioState.url,
             title: audioState.title,
             trackIndex: audioState.trackIndex,
-            currentTime: elapsedSeconds,
+            trackStartTime: audioState.trackStartTime,
+            serverTime: Date.now(),
             playlist: audioState.playlist
         }
     });
 
     io.emit('update-online-count', activeUsers.size);
 
-    // Đồng bộ Playlist từ WordPress lên Server
     socket.on('sync-playlist', (data) => {
         if (data.playlist && Array.isArray(data.playlist) && data.playlist.length > 0) {
+            const isFirstLoad = (audioState.playlist.length === 0 || !audioState.url);
             audioState.playlist = data.playlist;
-            if (!audioState.url && data.playlist[0]) {
+
+            if (isFirstLoad && data.playlist[0]) {
                 audioState.url = data.playlist[0].url;
                 audioState.title = data.playlist[0].title || 'Bài 1';
                 audioState.trackIndex = 0;
-                audioState.startTime = Date.now();
+                audioState.trackStartTime = Date.now();
 
                 io.emit('sync-audio-track', {
                     url: audioState.url,
                     title: audioState.title,
                     trackIndex: 0,
-                    currentTime: 0
+                    trackStartTime: audioState.trackStartTime,
+                    serverTime: Date.now()
                 });
             }
         }
     });
 
-    // Xử lý tự động chuyển bài đồng bộ cho cả phòng khi kết thúc bài
     socket.on('track-ended', (endedIndex) => {
         if (audioState.playlist.length > 0 && endedIndex === audioState.trackIndex) {
             audioState.trackIndex = (audioState.trackIndex + 1) % audioState.playlist.length;
@@ -91,13 +101,14 @@ io.on('connection', (socket) => {
             if (nextTrack) {
                 audioState.url = nextTrack.url;
                 audioState.title = nextTrack.title || `Bài ${audioState.trackIndex + 1}`;
-                audioState.startTime = Date.now();
+                audioState.trackStartTime = Date.now();
 
                 io.emit('sync-audio-track', {
                     url: audioState.url,
                     title: audioState.title,
                     trackIndex: audioState.trackIndex,
-                    currentTime: 0
+                    trackStartTime: audioState.trackStartTime,
+                    serverTime: Date.now()
                 });
             }
         }
