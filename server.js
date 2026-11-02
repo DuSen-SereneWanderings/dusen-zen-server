@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v6.5.0 User Identity Fix)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v6.6.0 Exact Online Count Fix)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -35,8 +35,12 @@ let currentTrackIndex = 0;
 let trackStartTime = Date.now();
 let activePlaylist = [];
 
+function getExactOnlineCount() {
+    return io.of("/").sockets.size;
+}
+
 io.on('connection', (socket) => {
-    // 1. Kiểm tra vị trí trống & Ghi nhớ tên User thật
+    // 1. Ghi nhớ thông tin User khi vào
     socket.on('request-entry', (userObj) => {
         if (userObj && userObj.name) {
             socket.userName = userObj.name;
@@ -55,9 +59,11 @@ io.on('connection', (socket) => {
             maxSeats: MAX_SEATS,
             seats: seats
         });
+        
+        io.emit('update-online-count', getExactOnlineCount());
     });
 
-    // 2. Gửi trạng thái khởi tạo đầy đủ cho Client
+    // 2. Gửi trạng thái khởi tạo cho Client
     socket.emit('init-state', {
         seats: seats,
         totalHearts: totalHearts,
@@ -70,7 +76,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 3. Đăng ký nhận vị trí (Claim Seat) với Tên User thật
+    // 3. Đăng ký nhận vị trí (Claim Seat)
     socket.on('claim-seat', (seatId) => {
         seats = seats.map(s => {
             if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
@@ -91,7 +97,7 @@ io.on('connection', (socket) => {
         io.emit('seat-state-changed', seats);
     });
 
-    // 4. Đồng bộ Nhạc Thiền Realtime
+    // 4. Đồng bộ Nhạc Thiền
     socket.on('sync-playlist', (data) => {
         if (data && Array.isArray(data.playlist) && data.playlist.length > 0) {
             activePlaylist = data.playlist;
@@ -111,7 +117,7 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 5. Gửi Thương (Hearts) Realtime
+    // 5. Gửi Thương Realtime
     socket.on('send-heart', (data) => {
         totalHearts++;
         const senderName = data.userName || socket.userName || 'Lữ khách';
@@ -141,7 +147,7 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 7. Khi User ngắt kết nối
+    // 7. Ngắt kết nối & Cập nhật số lữ khách chính xác
     socket.on('disconnect', () => {
         let freedSeat = false;
         seats = seats.map(s => {
@@ -155,10 +161,10 @@ io.on('connection', (socket) => {
         if (freedSeat) {
             io.emit('seat-state-changed', seats);
         }
-        io.emit('update-online-count', io.engine.clientsCount);
+        io.emit('update-online-count', getExactOnlineCount());
     });
 
-    io.emit('update-online-count', io.engine.clientsCount);
+    io.emit('update-online-count', getExactOnlineCount());
 });
 
 setInterval(() => {
@@ -174,5 +180,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v6.5.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v6.6.0 running on port ${PORT}`);
 });
