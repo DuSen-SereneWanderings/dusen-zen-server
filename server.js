@@ -28,7 +28,6 @@ let seatsState = Array.from({ length: MAX_SEATS }, (_, i) => {
     };
 });
 
-// BỘ DỮ LIỆU BÀI HÁT VÀ MASTER CLOCK
 let audioState = {
     playlist: [],
     trackIndex: 0,
@@ -153,6 +152,7 @@ io.on('connection', (socket) => {
         }
     });
 
+    // 1. XỬ LÝ GỬI THƯƠNG (THẢ TIM)
     socket.on('send-heart', (data) => {
         totalHearts++;
         const user = activeUsers.get(socket.id);
@@ -164,6 +164,20 @@ io.on('connection', (socket) => {
             userName: senderName,
             senderSocketId: socket.id,
             totalHearts: totalHearts
+        });
+    });
+
+    // 2. BỔ SUNG NÂNG CẤP: BROADCAST THẢ HOA ĐĂNG TÂM NGUYỆN TOÀN PHÒNG
+    socket.on('send-lantern', (data) => {
+        const user = activeUsers.get(socket.id);
+        const senderName = (user && user.name) ? user.name : (data && data.userName ? data.userName : 'Lữ khách');
+        const senderSeatId = (user && user.seatId) ? user.seatId : (data && data.seatId ? data.seatId : null);
+
+        io.emit('lantern-broadcast', {
+            seatId: senderSeatId,
+            userName: senderName,
+            word: data.word || 'An yên',
+            senderSocketId: socket.id
         });
     });
 
@@ -182,5 +196,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Server Realtime running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v6.0.0 running on port ${PORT}`);
 });
