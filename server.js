@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v6.4.0)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v6.5.0 User Identity Fix)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -36,8 +36,15 @@ let trackStartTime = Date.now();
 let activePlaylist = [];
 
 io.on('connection', (socket) => {
-    // 1. Kiểm tra vị trí trống khi user mở popup
+    // 1. Kiểm tra vị trí trống & Ghi nhớ tên User thật
     socket.on('request-entry', (userObj) => {
+        if (userObj && userObj.name) {
+            socket.userName = userObj.name;
+            socket.userAvatar = userObj.avatar || '';
+        } else {
+            socket.userName = 'Lữ khách';
+        }
+
         const occupiedCount = seats.filter(s => s.occupiedBy !== null).length;
         const availableSeats = MAX_SEATS - occupiedCount;
         const isFull = availableSeats <= 0;
@@ -63,7 +70,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 3. Đăng ký nhận vị trí (Claim Seat)
+    // 3. Đăng ký nhận vị trí (Claim Seat) với Tên User thật
     socket.on('claim-seat', (seatId) => {
         seats = seats.map(s => {
             if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
@@ -107,25 +114,27 @@ io.on('connection', (socket) => {
     // 5. Gửi Thương (Hearts) Realtime
     socket.on('send-heart', (data) => {
         totalHearts++;
+        const senderName = data.userName || socket.userName || 'Lữ khách';
         io.emit('heart-broadcast', {
             seatId: data.seatId,
-            userName: data.userName,
+            userName: senderName,
             senderSocketId: socket.id,
             totalHearts: totalHearts
         });
     });
 
-    // 6. Thả Hoa Đăng Realtime (Đồng bộ 3 từ tâm nguyện cho TẤT CẢ USER)
+    // 6. Thả Hoa Đăng Realtime
     socket.on('send-lantern', (data) => {
         const word = data.word || 'An yên';
         if (!lanternCounts[word]) {
             lanternCounts[word] = 0;
         }
         lanternCounts[word]++;
+        const senderName = data.userName || socket.userName || 'Lữ khách';
 
         io.emit('lantern-broadcast', {
             seatId: data.seatId,
-            userName: data.userName,
+            userName: senderName,
             word: word,
             senderSocketId: socket.id,
             lanternCounts: lanternCounts
@@ -152,7 +161,6 @@ io.on('connection', (socket) => {
     io.emit('update-online-count', io.engine.clientsCount);
 });
 
-// Heartbeat giữ nhạc chạy đồng bộ
 setInterval(() => {
     if (activePlaylist.length > 0) {
         io.emit('audio-sync-heartbeat', {
@@ -166,5 +174,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v6.5.0 running on port ${PORT}`);
 });
