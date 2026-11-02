@@ -1,10 +1,17 @@
+/**
+ * Du Sen Zen Pond - Realtime Socket.io Server (v6.4.0)
+ * GitHub Repo Server code for Render deployment
+ */
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);
+app.use(cors());
 
+const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
         origin: "*",
@@ -13,188 +20,151 @@ const io = new Server(server, {
 });
 
 const MAX_SEATS = 17;
+let seats = Array.from({ length: MAX_SEATS }, (_, i) => ({
+    id: i + 1,
+    occupiedBy: null
+}));
+
 let totalHearts = 0;
-
-let seatsState = Array.from({ length: MAX_SEATS }, (_, i) => {
-    const seatId = i + 1;
-    const angle = (i * 2 * Math.PI) / MAX_SEATS;
-    const radiusX = (seatId % 2 !== 0) ? 280 : 200;
-    const radiusY = (seatId % 2 !== 0) ? 140 : 100;
-    return {
-        id: seatId,
-        x: Math.round(radiusX * Math.cos(angle)),
-        y: Math.round(radiusY * Math.sin(angle)),
-        occupiedBy: null
-    };
-});
-
-let audioState = {
-    playlist: [],
-    trackIndex: 0,
-    url: '',
-    title: 'Chưa chọn bài phát',
-    trackStartTime: Date.now()
+let lanternCounts = {
+    'An yên': 0,
+    'Bình an': 0,
+    'Biết ơn': 0
 };
-
-let activeUsers = new Map();
-
-// PHÁT XUNG HEARTBEAT MỖI 4 GIÂY ĐỂ ĐỒNG BỘ ÂM THANH TUYỆT ĐỐI TOÀN PHÒNG
-setInterval(() => {
-    if (audioState.url) {
-        io.emit('audio-sync-heartbeat', {
-            trackIndex: audioState.trackIndex,
-            url: audioState.url,
-            title: audioState.title,
-            trackStartTime: audioState.trackStartTime,
-            serverTime: Date.now()
-        });
-    }
-}, 4000);
+let currentTrackIndex = 0;
+let trackStartTime = Date.now();
+let activePlaylist = [];
 
 io.on('connection', (socket) => {
-    activeUsers.set(socket.id, { socketId: socket.id, seatId: null, name: 'Lữ khách' });
+    // 1. Kiểm tra vị trí trống khi user mở popup
+    socket.on('request-entry', (userObj) => {
+        const occupiedCount = seats.filter(s => s.occupiedBy !== null).length;
+        const availableSeats = MAX_SEATS - occupiedCount;
+        const isFull = availableSeats <= 0;
 
+        socket.emit('entry-status-checked', {
+            isFull: isFull,
+            availableSeats: availableSeats,
+            maxSeats: MAX_SEATS,
+            seats: seats
+        });
+    });
+
+    // 2. Gửi trạng thái khởi tạo đầy đủ cho Client
     socket.emit('init-state', {
-        maxSeats: MAX_SEATS,
-        seats: seatsState,
-        onlineCount: activeUsers.size,
+        seats: seats,
         totalHearts: totalHearts,
+        lanternCounts: lanternCounts,
         audioState: {
-            url: audioState.url,
-            title: audioState.title,
-            trackIndex: audioState.trackIndex,
-            trackStartTime: audioState.trackStartTime,
-            serverTime: Date.now(),
-            playlist: audioState.playlist
+            trackIndex: currentTrackIndex,
+            trackStartTime: trackStartTime,
+            url: activePlaylist[currentTrackIndex]?.url || '',
+            title: activePlaylist[currentTrackIndex]?.title || ''
         }
     });
 
-    io.emit('update-online-count', activeUsers.size);
-
-    socket.on('sync-playlist', (data) => {
-        if (data.playlist && Array.isArray(data.playlist) && data.playlist.length > 0) {
-            const isFirstLoad = (audioState.playlist.length === 0 || !audioState.url);
-            audioState.playlist = data.playlist;
-
-            if (isFirstLoad && data.playlist[0]) {
-                audioState.url = data.playlist[0].url;
-                audioState.title = data.playlist[0].title || 'Bài 1';
-                audioState.trackIndex = 0;
-                audioState.trackStartTime = Date.now();
-
-                io.emit('sync-audio-track', {
-                    url: audioState.url,
-                    title: audioState.title,
-                    trackIndex: 0,
-                    trackStartTime: audioState.trackStartTime,
-                    serverTime: Date.now()
-                });
+    // 3. Đăng ký nhận vị trí (Claim Seat)
+    socket.on('claim-seat', (seatId) => {
+        seats = seats.map(s => {
+            if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
+                return { ...s, occupiedBy: null };
             }
+            return s;
+        });
+
+        const targetIndex = seats.findIndex(s => s.id === seatId);
+        if (targetIndex !== -1 && !seats[targetIndex].occupiedBy) {
+            seats[targetIndex].occupiedBy = {
+                socketId: socket.id,
+                name: socket.userName || 'Lữ khách',
+                avatar: socket.userAvatar || ''
+            };
+        }
+
+        io.emit('seat-state-changed', seats);
+    });
+
+    // 4. Đồng bộ Nhạc Thiền Realtime
+    socket.on('sync-playlist', (data) => {
+        if (data && Array.isArray(data.playlist) && data.playlist.length > 0) {
+            activePlaylist = data.playlist;
         }
     });
 
     socket.on('track-ended', (endedIndex) => {
-        if (audioState.playlist.length > 0 && endedIndex === audioState.trackIndex) {
-            audioState.trackIndex = (audioState.trackIndex + 1) % audioState.playlist.length;
-            const nextTrack = audioState.playlist[audioState.trackIndex];
-            if (nextTrack) {
-                audioState.url = nextTrack.url;
-                audioState.title = nextTrack.title || `Bài ${audioState.trackIndex + 1}`;
-                audioState.trackStartTime = Date.now();
+        if (activePlaylist.length === 0) return;
+        currentTrackIndex = (endedIndex + 1) % activePlaylist.length;
+        trackStartTime = Date.now();
 
-                io.emit('sync-audio-track', {
-                    url: audioState.url,
-                    title: audioState.title,
-                    trackIndex: audioState.trackIndex,
-                    trackStartTime: audioState.trackStartTime,
-                    serverTime: Date.now()
-                });
-            }
-        }
-    });
-
-    socket.on('request-entry', (userData) => {
-        const user = activeUsers.get(socket.id);
-        if (user) {
-            user.name = userData.name || 'Lữ khách';
-            user.avatar = userData.avatar || '';
-        }
-
-        const occupiedCount = seatsState.filter(s => s.occupiedBy !== null).length;
-        
-        socket.emit('entry-status-checked', {
-            maxSeats: MAX_SEATS,
-            occupiedCount: occupiedCount,
-            availableSeats: MAX_SEATS - occupiedCount,
-            isFull: occupiedCount >= MAX_SEATS,
-            seats: seatsState
+        io.emit('sync-audio-track', {
+            trackIndex: currentTrackIndex,
+            trackStartTime: trackStartTime,
+            url: activePlaylist[currentTrackIndex].url,
+            title: activePlaylist[currentTrackIndex].title
         });
     });
 
-    socket.on('claim-seat', (seatId) => {
-        const targetSeat = seatsState.find(s => s.id === seatId);
-        const user = activeUsers.get(socket.id);
-
-        if (targetSeat && !targetSeat.occupiedBy && user) {
-            if (user.seatId) {
-                const prevSeat = seatsState.find(s => s.id === user.seatId);
-                if (prevSeat) prevSeat.occupiedBy = null;
-            }
-
-            targetSeat.occupiedBy = {
-                socketId: socket.id,
-                name: user.name,
-                avatar: user.avatar
-            };
-            user.seatId = seatId;
-
-            io.emit('seat-state-changed', seatsState);
-        }
-    });
-
-    // 1. XỬ LÝ GỬI THƯƠNG (THẢ TIM)
+    // 5. Gửi Thương (Hearts) Realtime
     socket.on('send-heart', (data) => {
         totalHearts++;
-        const user = activeUsers.get(socket.id);
-        const senderName = (user && user.name) ? user.name : (data && data.userName ? data.userName : 'Lữ khách');
-        const senderSeatId = (user && user.seatId) ? user.seatId : (data && data.seatId ? data.seatId : null);
-
         io.emit('heart-broadcast', {
-            seatId: senderSeatId,
-            userName: senderName,
+            seatId: data.seatId,
+            userName: data.userName,
             senderSocketId: socket.id,
             totalHearts: totalHearts
         });
     });
 
-    // 2. BỔ SUNG NÂNG CẤP: BROADCAST THẢ HOA ĐĂNG TÂM NGUYỆN TOÀN PHÒNG
+    // 6. Thả Hoa Đăng Realtime (Đồng bộ 3 từ tâm nguyện cho TẤT CẢ USER)
     socket.on('send-lantern', (data) => {
-        const user = activeUsers.get(socket.id);
-        const senderName = (user && user.name) ? user.name : (data && data.userName ? data.userName : 'Lữ khách');
-        const senderSeatId = (user && user.seatId) ? user.seatId : (data && data.seatId ? data.seatId : null);
+        const word = data.word || 'An yên';
+        if (!lanternCounts[word]) {
+            lanternCounts[word] = 0;
+        }
+        lanternCounts[word]++;
 
         io.emit('lantern-broadcast', {
-            seatId: senderSeatId,
-            userName: senderName,
-            word: data.word || 'An yên',
-            senderSocketId: socket.id
+            seatId: data.seatId,
+            userName: data.userName,
+            word: word,
+            senderSocketId: socket.id,
+            lanternCounts: lanternCounts
         });
     });
 
+    // 7. Khi User ngắt kết nối
     socket.on('disconnect', () => {
-        const user = activeUsers.get(socket.id);
-        if (user && user.seatId) {
-            const seat = seatsState.find(s => s.id === user.seatId);
-            if (seat) seat.occupiedBy = null;
-        }
-        activeUsers.delete(socket.id);
+        let freedSeat = false;
+        seats = seats.map(s => {
+            if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
+                freedSeat = true;
+                return { ...s, occupiedBy: null };
+            }
+            return s;
+        });
 
-        io.emit('seat-state-changed', seatsState);
-        io.emit('update-online-count', activeUsers.size);
+        if (freedSeat) {
+            io.emit('seat-state-changed', seats);
+        }
+        io.emit('update-online-count', io.engine.clientsCount);
     });
+
+    io.emit('update-online-count', io.engine.clientsCount);
 });
+
+// Heartbeat giữ nhạc chạy đồng bộ
+setInterval(() => {
+    if (activePlaylist.length > 0) {
+        io.emit('audio-sync-heartbeat', {
+            trackIndex: currentTrackIndex,
+            trackStartTime: trackStartTime,
+            url: activePlaylist[currentTrackIndex]?.url || '',
+            title: activePlaylist[currentTrackIndex]?.title || ''
+        });
+    }
+}, 5000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v6.0.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server running on port ${PORT}`);
 });
