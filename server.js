@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v6.6.0 Exact Online Count Fix)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v8.0.0 Anonymous Wishing Leaves Broadcast)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -147,7 +147,20 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 7. Ngắt kết nối & Cập nhật số lữ khách chính xác
+    // 7. [MỚI V8.0.0] Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime cho tất cả Lữ Khách
+    socket.on('dzp_send_wish', (data) => {
+        const wishText = (data && data.text) ? String(data.text).trim() : '';
+        if (!wishText) return;
+
+        // Phát sóng sự kiện 'dzp_receive_wish' đến TẤT CẢ các client đang kết nối (kể cả người gửi)
+        io.emit('dzp_receive_wish', {
+            text: wishText,
+            senderSocketId: socket.id,
+            timestamp: Date.now()
+        });
+    });
+
+    // 8. Ngắt kết nối & Cập nhật số lữ khách chính xác
     socket.on('disconnect', () => {
         let freedSeat = false;
         seats = seats.map(s => {
@@ -180,5 +193,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v6.6.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v8.0.0 running on port ${PORT}`);
 });
