@@ -14,6 +14,9 @@ const io = new Server(server, {
 
 const MAX_SEATS = 17;
 
+// Biến lưu trữ tổng số tim thả của toàn phòng thiền
+let totalHearts = 0;
+
 // Tự động tính toán tọa độ 17 vị trí hòn đá thiền xoay quanh hồ theo dạng so le 2 vòng
 let seatsState = [];
 for (let i = 1; i <= MAX_SEATS; i++) {
@@ -43,11 +46,13 @@ let activeUsers = new Map();
 io.on('connection', (socket) => {
     activeUsers.set(socket.id, { socketId: socket.id, seatId: null, name: 'Lữ khách' });
 
+    // 1. Gửi trạng thái ban đầu kèm TỔNG SỐ TIM cho lữ khách mới vào
     socket.emit('init-state', {
         maxSeats: MAX_SEATS,
         seats: seatsState,
         track: currentTrack,
-        onlineCount: activeUsers.size
+        onlineCount: activeUsers.size,
+        totalHearts: totalHearts
     });
 
     io.emit('update-online-count', activeUsers.size);
@@ -89,6 +94,25 @@ io.on('connection', (socket) => {
 
             io.emit('seat-state-changed', seatsState);
         }
+    });
+
+    // 2. BỘ XỬ LÝ GỬI THƯƠNG (THẢ TIM) TOÀN PHÒNG
+    socket.on('send-heart', (data) => {
+        totalHearts++; // Tăng tổng tim chung của hồ thiền
+
+        const user = activeUsers.get(socket.id);
+        const senderName = (user && user.name) ? user.name : (data && data.userName ? data.userName : 'Lữ khách');
+        const senderSeatId = (user && user.seatId) ? user.seatId : (data && data.seatId ? data.seatId : null);
+
+        const heartPayload = {
+            seatId: senderSeatId,
+            userName: senderName,
+            senderSocketId: socket.id,
+            totalHearts: totalHearts
+        };
+
+        // Phát tín hiệu tới TẤT CẢ mọi người trong phòng
+        io.emit('heart-broadcast', heartPayload);
     });
 
     socket.on('admin-control-audio', (audioData) => {
