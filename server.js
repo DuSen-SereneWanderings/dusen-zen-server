@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Multi-Room Server (v10.0.2 - Safe Hybrid: Root for Old Room & /room-2 for Cloned Room)
+ * Du Sen Zen Pond - Realtime Multi-Room Server (v10.0.2 - Clean Hybrid Server)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -21,7 +21,6 @@ const io = new Server(server, {
 
 const MAX_SEATS = 17;
 
-// Hàm khởi tạo bộ trạng thái độc lập cho từng phòng
 function createRoomState() {
     return {
         seats: Array.from({ length: MAX_SEATS }, (_, i) => ({
@@ -40,11 +39,9 @@ function createRoomState() {
     };
 }
 
-// Khởi tạo 2 trạng thái riêng biệt cho 2 phòng
-const room1State = createRoomState(); // Dành cho phòng cũ (chạy ở gốc /)
-const room2State = createRoomState(); // Dành cho phòng mới clone (chạy ở /room-2)
+const room1State = createRoomState();
+const room2State = createRoomState();
 
-// Hàm hỗ trợ trích xuất Giờ & Phút chuẩn múi giờ Việt Nam (Asia/Ho_Chi_Minh)
 function getVietnamTimeObj() {
     try {
         const now = new Date();
@@ -65,14 +62,12 @@ function getVietnamTimeObj() {
     }
 }
 
-// Hàm cài đặt toàn bộ sự kiện Socket chuẩn xác cho từng target (IO gốc hoặc Namespace)
 function setupRoomEvents(targetIo, state) {
     function getExactOnlineCount() {
         return targetIo.sockets.size;
     }
 
     targetIo.on('connection', (socket) => {
-        // 1. Ghi nhớ thông tin User khi vào phòng
         socket.on('request-entry', (userObj) => {
             if (userObj && userObj.name) {
                 socket.userName = userObj.name;
@@ -95,7 +90,6 @@ function setupRoomEvents(targetIo, state) {
             targetIo.emit('update-online-count', getExactOnlineCount());
         });
 
-        // 2. Gửi trạng thái khởi tạo riêng cho Client trong phòng
         socket.emit('init-state', {
             seats: state.seats,
             totalHearts: state.totalHearts,
@@ -108,7 +102,6 @@ function setupRoomEvents(targetIo, state) {
             }
         });
 
-        // 3. Đăng ký nhận vị trí (Claim Seat)
         socket.on('claim-seat', (seatId) => {
             state.seats = state.seats.map(s => {
                 if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
@@ -129,7 +122,6 @@ function setupRoomEvents(targetIo, state) {
             targetIo.emit('seat-state-changed', state.seats);
         });
 
-        // 4. Đồng bộ Nhạc Thiền riêng cho phòng
         socket.on('sync-playlist', (data) => {
             if (data && Array.isArray(data.playlist) && data.playlist.length > 0) {
                 state.activePlaylist = data.playlist;
@@ -149,7 +141,6 @@ function setupRoomEvents(targetIo, state) {
             });
         });
 
-        // 5. Gửi Thương Realtime trong phòng
         socket.on('send-heart', (data) => {
             state.totalHearts++;
             const senderName = data.userName || socket.userName || 'Lữ khách';
@@ -161,7 +152,6 @@ function setupRoomEvents(targetIo, state) {
             });
         });
 
-        // 6. Thả Hoa Đăng Realtime trong phòng (hỗ trợ linh hoạt mọi từ khóa)
         socket.on('send-lantern', (data) => {
             const word = data.word || 'An yên';
             if (!state.lanternCounts[word]) {
@@ -179,7 +169,6 @@ function setupRoomEvents(targetIo, state) {
             });
         });
 
-        // 7. Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime trong phòng
         socket.on('dzp_send_wish', (data) => {
             const wishText = (data && data.text) ? String(data.text).trim() : '';
             if (!wishText) return;
@@ -191,7 +180,6 @@ function setupRoomEvents(targetIo, state) {
             });
         });
 
-        // 8. Ngắt kết nối & Cập nhật số lữ khách online trong phòng
         socket.on('disconnect', () => {
             let freedSeat = false;
             state.seats = state.seats.map(s => {
@@ -212,22 +200,12 @@ function setupRoomEvents(targetIo, state) {
     });
 }
 
-// ----------------------------------------------------
-// ĐĂNG KÝ 2 PHÒNG RIÊNG BIỆT TRÊN SERVER
-// ----------------------------------------------------
-
-// 1. PHÒNG CŨ (Gốc): Gắn trực tiếp vào `io` gốc -> Plugin cũ không bị ảnh hưởng 100%
 setupRoomEvents(io, room1State);
 
-// 2. PHÒNG MỚI (CLONE): Gắn vào namespace `/room-2` -> Khớp hoàn toàn với plugin clone
 const room2Nsp = io.of('/room-2');
 setupRoomEvents(room2Nsp, room2State);
 
-// ----------------------------------------------------
-// ĐỊNH KỲ ĐỒNG BỘ NHẠC CHO CẢ 2 PHÒNG
-// ----------------------------------------------------
 setInterval(() => {
-    // Phát cho phòng cũ (gốc)
     if (room1State.activePlaylist.length > 0) {
         io.emit('audio-sync-heartbeat', {
             trackIndex: room1State.currentTrackIndex,
@@ -236,7 +214,6 @@ setInterval(() => {
             title: room1State.activePlaylist[room1State.currentTrackIndex]?.title || ''
         });
     }
-    // Phát cho phòng mới (/room-2)
     if (room2State.activePlaylist.length > 0) {
         room2Nsp.emit('audio-sync-heartbeat', {
             trackIndex: room2State.currentTrackIndex,
@@ -249,5 +226,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Multi-Room Server v10.0.2 running on port ${PORT} (Room 1 at root, Room 2 at /room-2)`);
+    console.log(`Zen Pond Clean Server running on port ${PORT} (Room 1 at root, Room 2 at /room-2)`);
 });
