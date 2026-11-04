@@ -11,12 +11,24 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// ROUTE HEALTH CHECK GIỮ CHO SERVER RENDER KHÔNG BỊ TRÀN LOG HOẶC NGỦ LỖI
+app.get('/', (req, res) => {
+    res.status(200).send('Du Sen Zen Pond Realtime Server v9.5.0 is Running OK');
+});
+
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', time: new Date().toISOString() });
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    pingTimeout: 30000,
+    pingInterval: 10000,
+    allowEIO3: true
 });
 
 const MAX_SEATS = 17;
