@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v9.5.0 - Pure UTC+7 Math & Reconnect Stability)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v9.5.1 - Anti-Kickout & Schedule Sync)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -11,9 +11,8 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// ROUTE HEALTH CHECK GIỮ CHO SERVER RENDER KHÔNG BỊ TRÀN LOG HOẶC NGỦ LỖI
 app.get('/', (req, res) => {
-    res.status(200).send('Du Sen Zen Pond Realtime Server v9.5.0 is Running OK');
+    res.status(200).send('Zen Pond Realtime Server v9.5.1 is Running OK');
 });
 
 app.get('/health', (req, res) => {
@@ -47,7 +46,6 @@ let currentTrackIndex = 0;
 let trackStartTime = Date.now();
 let activePlaylist = [];
 
-// 1. Thuật toán tính giờ Việt Nam (UTC+7) thuần toán học cho Server
 function getVietnamTimeObj() {
     const now = new Date();
     const vnMs = now.getTime() + (7 * 3600000);
@@ -65,7 +63,6 @@ function safeParseInt(val, fallback) {
     return isNaN(parsed) ? fallback : parsed;
 }
 
-// 2. Kiểm tra trạng thái phòng trên Server
 function checkServerRoomStatus(settings) {
     const s = settings || {};
 
@@ -83,20 +80,23 @@ function checkServerRoomStatus(settings) {
     const openFromH = safeParseInt(s.openFromH, 0);
     const openFromM = safeParseInt(s.openFromM, 0);
     const openToH   = safeParseInt(s.openToH, 23);
-    const openToM   = safeParseInt(s.openToM, 57);
+    const openToM   = safeParseInt(s.openToM, 59);
+
+    if ((openFromH === 0 && openFromM === 0 && openToH === 23 && openToM >= 58) ||
+        (openFromH === openToH && openFromM === openToM)) {
+        return { isOpen: true, isClosed: false, scheduleStr: 'Mở cửa cả ngày' };
+    }
 
     const vnTime = getVietnamTimeObj();
     const currTotal  = vnTime.hour * 60 + vnTime.minute;
     const openTotal  = openFromH * 60 + openFromM;
-    const closeTotal = openToH * 60 + openToM;
+    const closeTotal = openToH * 60 + openToM + 1;
 
     let isOpen = true;
     if (openTotal < closeTotal) {
         isOpen = (currTotal >= openTotal && currTotal < closeTotal);
-    } else if (openTotal > closeTotal) {
-        isOpen = (currTotal >= openTotal || currTotal < closeTotal);
     } else {
-        isOpen = true;
+        isOpen = (currTotal >= openTotal || currTotal < closeTotal);
     }
 
     const pad = (n) => String(n).padStart(2, '0');
@@ -113,7 +113,6 @@ function getExactOnlineCount() {
     return io.of("/").sockets.size;
 }
 
-// 3. Xử lý Socket Realtime
 io.on('connection', (socket) => {
 
     socket.on('request-entry', (payload) => {
@@ -274,5 +273,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v9.5.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v9.5.1 running on port ${PORT}`);
 });
