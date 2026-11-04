@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v8.0.0 Anonymous Wishing Leaves Broadcast)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v9.4.0 - Vietnam Timezone & Stable Room Schedule)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -35,12 +35,90 @@ let currentTrackIndex = 0;
 let trackStartTime = Date.now();
 let activePlaylist = [];
 
+// --------------------------------------------------------------------------
+// 1. HÀM TÍNH GIỜ VIỆT NAM (UTC+7) - GIẢI QUYẾT LỆCH GIỜ TRÊN MÁY CHỦ RENDER
+// --------------------------------------------------------------------------
+function getVietnamTimeObj() {
+    try {
+        const now = new Date();
+        const options = { timeZone: 'Asia/Ho_Chi_Minh', hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false };
+        const formatter = new Intl.DateTimeFormat('en-US', options);
+        const parts = formatter.formatToParts(now);
+        let h = null, m = null, s = null;
+        parts.forEach(p => {
+            if (p.type === 'hour') h = parseInt(p.value, 10);
+            if (p.type === 'minute') m = parseInt(p.value, 10);
+            if (p.type === 'second') s = parseInt(p.value, 10);
+        });
+        if (h !== null && !isNaN(h)) {
+            if (h === 24) h = 0;
+            return { hour: h, minute: m || 0, second: s || 0 };
+        }
+    } catch (e) {}
+
+    // Fallback tính toán cộng bù 7 tiếng chuẩn UTC+7 cho mọi môi trường
+    const now = new Date();
+    const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const vnDate = new Date(utcMs + (7 * 3600000));
+    return { hour: vnDate.getHours(), minute: vnDate.getMinutes(), second: vnDate.getSeconds() };
+}
+
+// --------------------------------------------------------------------------
+// 2. HÀM KIỂM TRA TRẠNG THÁI MỞ/ĐÓNG PHÒNG CHUẨN XÁC THEO GIỜ VIỆT NAM
+// --------------------------------------------------------------------------
+function checkServerRoomStatus(settings) {
+    const s = settings || {};
+
+    // Kiểm tra cờ đóng phòng thủ công từ WordPress/Settings (Chống lỗi ép kiểu string '0' / 'false')
+    const isServerClosed = (
+        s.isClosedTime === true || 
+        s.isClosedTime === 1 || 
+        s.isClosedTime === '1' || 
+        s.isClosedTime === 'true'
+    );
+
+    // Lấy thông số khung giờ (Mặc định mở 00:00 - 23:57 nếu không truyền)
+    const openFromH = (s.openFromH !== undefined && s.openFromH !== null) ? parseInt(s.openFromH, 10) : 0;
+    const openFromM = (s.openFromM !== undefined && s.openFromM !== null) ? parseInt(s.openFromM, 10) : 0;
+    const openToH   = (s.openToH !== undefined && s.openToH !== null)   ? parseInt(s.openToH, 10)   : 23;
+    const openToM   = (s.openToM !== undefined && s.openToM !== null)   ? parseInt(s.openToM, 10)   : 57;
+
+    const vnTime = getVietnamTimeObj();
+    const currTotal  = vnTime.hour * 60 + vnTime.minute;
+    const openTotal  = openFromH * 60 + openFromM;
+    const closeTotal = openToH * 60 + openToM;
+
+    let isOpen = true;
+    if (openTotal < closeTotal) {
+        isOpen = (currTotal >= openTotal && currTotal < closeTotal);
+    } else if (openTotal > closeTotal) {
+        isOpen = (currTotal >= openTotal || currTotal < closeTotal);
+    }
+
+    if (isServerClosed) {
+        isOpen = false;
+    }
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const scheduleStr = s.scheduleStr || `${pad(openFromH)}:${pad(openFromM)} đến ${pad(openToH)}:${pad(openToM)}`;
+
+    return {
+        isOpen: isOpen,
+        isClosed: !isOpen,
+        scheduleStr: scheduleStr
+    };
+}
+
 function getExactOnlineCount() {
     return io.of("/").sockets.size;
 }
 
+// --------------------------------------------------------------------------
+// 3. XỬ LÝ LẮNG NGHE SỰ KIỆN REALTIME CỦA SOCKET.IO
+// --------------------------------------------------------------------------
 io.on('connection', (socket) => {
-    // 1. Ghi nhớ thông tin User khi vào
+
+    // 1. Ghi nhớ thông tin User & Kiểm tra Trạng thái Vào phòng
     socket.on('request-entry', (userObj) => {
         if (userObj && userObj.name) {
             socket.userName = userObj.name;
@@ -49,11 +127,18 @@ io.on('connection', (socket) => {
             socket.userName = 'Lữ khách';
         }
 
+        // Tính toán trạng thái lịch mở/đóng phòng dựa trên dữ liệu Client/WordPress gửi lên
+        const clientSettings = (userObj && userObj.settings) ? userObj.settings : (userObj || {});
+        const roomStatus = checkServerRoomStatus(clientSettings);
+
         const occupiedCount = seats.filter(s => s.occupiedBy !== null).length;
         const availableSeats = MAX_SEATS - occupiedCount;
         const isFull = availableSeats <= 0;
 
+        // Phát phản hồi kiểm tra cổng vào phòng về Client
         socket.emit('entry-status-checked', {
+            isClosed: roomStatus.isClosed,
+            scheduleStr: roomStatus.scheduleStr,
             isFull: isFull,
             availableSeats: availableSeats,
             maxSeats: MAX_SEATS,
@@ -76,7 +161,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 3. Đăng ký nhận vị trí (Claim Seat)
+    // 3. Đăng ký nhận vị trí an tọa (Claim Seat)
     socket.on('claim-seat', (seatId) => {
         seats = seats.map(s => {
             if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
@@ -147,12 +232,11 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 7. [MỚI V8.0.0] Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime cho tất cả Lữ Khách
+    // 7. Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime
     socket.on('dzp_send_wish', (data) => {
         const wishText = (data && data.text) ? String(data.text).trim() : '';
         if (!wishText) return;
 
-        // Phát sóng sự kiện 'dzp_receive_wish' đến TẤT CẢ các client đang kết nối (kể cả người gửi)
         io.emit('dzp_receive_wish', {
             text: wishText,
             senderSocketId: socket.id,
@@ -180,6 +264,9 @@ io.on('connection', (socket) => {
     io.emit('update-online-count', getExactOnlineCount());
 });
 
+// --------------------------------------------------------------------------
+// 4. HEARTBEAT ĐỒNG BỘ ÂM THANH MỖI 5 GIÂY
+// --------------------------------------------------------------------------
 setInterval(() => {
     if (activePlaylist.length > 0) {
         io.emit('audio-sync-heartbeat', {
@@ -191,7 +278,10 @@ setInterval(() => {
     }
 }, 5000);
 
+// --------------------------------------------------------------------------
+// 5. KHỞI CHẠY SERVER
+// --------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v8.0.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v9.4.0 running on port ${PORT}`);
 });
