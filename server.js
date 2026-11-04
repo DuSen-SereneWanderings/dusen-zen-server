@@ -83,18 +83,20 @@ function checkServerRoomStatus(settings) {
     const toH   = safeParseInt(s.openToH, 23);
     const toM   = safeParseInt(s.openToM, 59);
 
-    const scheduleMode = s.scheduleMode || 'closed';
+    const scheduleMode = s.scheduleMode || 'open'; // Mặc định là 'open' khi có thiết lập giờ mở
 
     const vnTime = getVietnamTimeObj();
     const currTotal = vnTime.hour * 60 + vnTime.minute;
     const fromTotal = fromH * 60 + fromM;
-    const toTotal   = toH * 60 + toM + 1;
+    const toTotal   = toH * 60 + toM; // Giữ nguyên mốc kết thúc chính xác, không cộng thêm 1
 
     let isInTimeRange = false;
-    if (fromTotal < toTotal) {
-        isInTimeRange = (currTotal >= fromTotal && currTotal < toTotal);
+    if (fromTotal <= toTotal) {
+        // Dùng dấu <= để tính trọn vẹn đến phút cuối cùng (ví dụ đến đúng 11:00 vẫn mở)
+        isInTimeRange = (currTotal >= fromTotal && currTotal <= toTotal);
     } else {
-        isInTimeRange = (currTotal >= fromTotal || currTotal < toTotal);
+        // Trường hợp qua đêm (ví dụ từ 22:00 đến 04:00 sáng hôm sau)
+        isInTimeRange = (currTotal >= fromTotal || currTotal <= toTotal);
     }
 
     let isOpen = true;
