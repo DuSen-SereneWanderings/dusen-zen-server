@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v10.0.0 - 3 Sessions Schedule & GMT+7 Timezone Support)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v10.0.3 - Full Multi-Room Support)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -20,49 +20,51 @@ const io = new Server(server, {
 });
 
 const MAX_SEATS = 17;
-let seats = Array.from({ length: MAX_SEATS }, (_, i) => ({
-    id: i + 1,
-    occupiedBy: null
-}));
 
-let totalHearts = 0;
-let lanternCounts = {
-    'An yên': 0,
-    'Bình an': 0,
-    'Biết ơn': 0
-};
-let currentTrackIndex = 0;
-let trackStartTime = Date.now();
-let activePlaylist = [];
+// LƯU TRỮ TRẠNG THÁI THEO TỪNG ROOM ID
+const rooms = {};
 
-// Hàm hỗ trợ trích xuất Giờ & Phút chuẩn múi giờ Việt Nam (Asia/Ho_Chi_Minh)
-function getVietnamTimeObj() {
-    try {
-        const now = new Date();
-        const options = { timeZone: 'Asia/Ho_Chi_Minh', hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false };
-        const formatter = new Intl.DateTimeFormat('en-US', options);
-        const parts = formatter.formatToParts(now);
-        let h = 0, m = 0, s = 0;
-        parts.forEach(p => {
-            if (p.type === 'hour') h = parseInt(p.value, 10);
-            if (p.type === 'minute') m = parseInt(p.value, 10);
-            if (p.type === 'second') s = parseInt(p.value, 10);
-        });
-        if (h === 24) h = 0;
-        return { hour: h, minute: m, second: s };
-    } catch(e) {
-        const now = new Date();
-        return { hour: now.getHours(), minute: now.getMinutes(), second: now.getSeconds() };
+// Hàm lấy hoặc khởi tạo dữ liệu cho một phòng
+function getRoomData(roomId) {
+    const rId = roomId || 'main';
+    if (!rooms[rId]) {
+        rooms[rId] = {
+            seats: Array.from({ length: MAX_SEATS }, (_, i) => ({
+                id: i + 1,
+                occupiedBy: null
+            })),
+            totalHearts: 0,
+            lanternCounts: {
+                'An yên': 0,
+                'Bình an': 0,
+                'Biết ơn': 0
+            },
+            currentTrackIndex: 0,
+            trackStartTime: Date.now(),
+            activePlaylist: []
+        };
     }
+    return rooms[rId];
 }
 
-function getExactOnlineCount() {
-    return io.of("/").sockets.size;
+// Đếm số người online chính xác theo từng Room
+function getRoomOnlineCount(roomId) {
+    const rId = roomId || 'main';
+    const roomAdapter = io.sockets.adapter.rooms.get(rId);
+    return roomAdapter ? roomAdapter.size : 0;
 }
 
 io.on('connection', (socket) => {
-    // 1. Ghi nhớ thông tin User khi vào
-    socket.on('request-entry', (userObj) => {
+    // 1. Trích xuất roomId từ Client (mặc định 'main')
+    const roomId = socket.handshake.query.roomId || 'main';
+    socket.roomId = roomId;
+    socket.join(roomId);
+
+    const room = getRoomData(roomId);
+
+    // 2. Ghi nhớ thông tin User khi vào phòng
+    socket.on('request-entry', (data) => {
+        const userObj = typeof data === 'object' ? data : {};
         if (userObj && userObj.name) {
             socket.userName = userObj.name;
             socket.userAvatar = userObj.avatar || '';
@@ -70,7 +72,7 @@ io.on('connection', (socket) => {
             socket.userName = 'Lữ khách';
         }
 
-        const occupiedCount = seats.filter(s => s.occupiedBy !== null).length;
+        const occupiedCount = room.seats.filter(s => s.occupiedBy !== null).length;
         const availableSeats = MAX_SEATS - occupiedCount;
         const isFull = availableSeats <= 0;
 
@@ -78,112 +80,124 @@ io.on('connection', (socket) => {
             isFull: isFull,
             availableSeats: availableSeats,
             maxSeats: MAX_SEATS,
-            seats: seats
+            seats: room.seats
         });
         
-        io.emit('update-online-count', getExactOnlineCount());
+        io.to(roomId).emit('update-online-count', getRoomOnlineCount(roomId));
     });
 
-    // 2. Gửi trạng thái khởi tạo cho Client
+    // 3. Gửi trạng thái khởi tạo cho Client vừa kết nối
     socket.emit('init-state', {
-        seats: seats,
-        totalHearts: totalHearts,
-        lanternCounts: lanternCounts,
+        seats: room.seats,
+        totalHearts: room.totalHearts,
+        lanternCounts: room.lanternCounts,
         audioState: {
-            trackIndex: currentTrackIndex,
-            trackStartTime: trackStartTime,
-            url: activePlaylist[currentTrackIndex]?.url || '',
-            title: activePlaylist[currentTrackIndex]?.title || ''
+            trackIndex: room.currentTrackIndex,
+            trackStartTime: room.trackStartTime,
+            url: room.activePlaylist[room.currentTrackIndex]?.url || '',
+            title: room.activePlaylist[room.currentTrackIndex]?.title || ''
         }
     });
 
-    // 3. Đăng ký nhận vị trí (Claim Seat)
-    socket.on('claim-seat', (seatId) => {
-        seats = seats.map(s => {
+    // 4. Đăng ký nhận vị trí (Claim Seat)
+    socket.on('claim-seat', (data) => {
+        const seatId = typeof data === 'object' ? data.seatId : data;
+        const currentRoom = getRoomData(socket.roomId);
+
+        currentRoom.seats = currentRoom.seats.map(s => {
             if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
                 return { ...s, occupiedBy: null };
             }
             return s;
         });
 
-        const targetIndex = seats.findIndex(s => s.id === seatId);
-        if (targetIndex !== -1 && !seats[targetIndex].occupiedBy) {
-            seats[targetIndex].occupiedBy = {
+        const targetIndex = currentRoom.seats.findIndex(s => s.id === seatId);
+        if (targetIndex !== -1 && !currentRoom.seats[targetIndex].occupiedBy) {
+            currentRoom.seats[targetIndex].occupiedBy = {
                 socketId: socket.id,
                 name: socket.userName || 'Lữ khách',
                 avatar: socket.userAvatar || ''
             };
         }
 
-        io.emit('seat-state-changed', seats);
+        io.to(socket.roomId).emit('seat-state-changed', currentRoom.seats);
     });
 
-    // 4. Đồng bộ Nhạc Thiền
+    // 5. Đồng bộ Nhạc Thiền theo Room
     socket.on('sync-playlist', (data) => {
+        const currentRoom = getRoomData(socket.roomId);
         if (data && Array.isArray(data.playlist) && data.playlist.length > 0) {
-            activePlaylist = data.playlist;
+            currentRoom.activePlaylist = data.playlist;
         }
     });
 
-    socket.on('track-ended', (endedIndex) => {
-        if (activePlaylist.length === 0) return;
-        currentTrackIndex = (endedIndex + 1) % activePlaylist.length;
-        trackStartTime = Date.now();
+    socket.on('track-ended', (data) => {
+        const currentRoom = getRoomData(socket.roomId);
+        const endedIndex = typeof data === 'object' ? data.trackIndex : data;
 
-        io.emit('sync-audio-track', {
-            trackIndex: currentTrackIndex,
-            trackStartTime: trackStartTime,
-            url: activePlaylist[currentTrackIndex].url,
-            title: activePlaylist[currentTrackIndex].title
+        if (currentRoom.activePlaylist.length === 0) return;
+        currentRoom.currentTrackIndex = (endedIndex + 1) % currentRoom.activePlaylist.length;
+        currentRoom.trackStartTime = Date.now();
+
+        io.to(socket.roomId).emit('sync-audio-track', {
+            trackIndex: currentRoom.currentTrackIndex,
+            trackStartTime: currentRoom.trackStartTime,
+            url: currentRoom.activePlaylist[currentRoom.currentTrackIndex].url,
+            title: currentRoom.activePlaylist[currentRoom.currentTrackIndex].title
         });
     });
 
-    // 5. Gửi Thương Realtime
+    // 6. Gửi Thương Realtime theo Room
     socket.on('send-heart', (data) => {
-        totalHearts++;
-        const senderName = data.userName || socket.userName || 'Lữ khách';
-        io.emit('heart-broadcast', {
-            seatId: data.seatId,
+        const currentRoom = getRoomData(socket.roomId);
+        currentRoom.totalHearts++;
+        const senderName = (data && data.userName) || socket.userName || 'Lữ khách';
+
+        io.to(socket.roomId).emit('heart-broadcast', {
+            seatId: data ? data.seatId : null,
             userName: senderName,
             senderSocketId: socket.id,
-            totalHearts: totalHearts
+            totalHearts: currentRoom.totalHearts
         });
     });
 
-    // 6. Thả Hoa Đăng Realtime
+    // 7. Thả Hoa Đăng Realtime theo Room
     socket.on('send-lantern', (data) => {
-        const word = data.word || 'An yên';
-        if (!lanternCounts[word]) {
-            lanternCounts[word] = 0;
+        const currentRoom = getRoomData(socket.roomId);
+        const word = (data && data.word) || 'An yên';
+        if (!currentRoom.lanternCounts[word]) {
+            currentRoom.lanternCounts[word] = 0;
         }
-        lanternCounts[word]++;
-        const senderName = data.userName || socket.userName || 'Lữ khách';
+        currentRoom.lanternCounts[word]++;
+        const senderName = (data && data.userName) || socket.userName || 'Lữ khách';
 
-        io.emit('lantern-broadcast', {
-            seatId: data.seatId,
+        io.to(socket.roomId).emit('lantern-broadcast', {
+            seatId: data ? data.seatId : null,
             userName: senderName,
             word: word,
             senderSocketId: socket.id,
-            lanternCounts: lanternCounts
+            lanternCounts: currentRoom.lanternCounts
         });
     });
 
-    // 7. Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime cho tất cả Lữ Khách
+    // 8. Phát sóng Lá Tâm Nguyệt Realtime theo Room
     socket.on('dzp_send_wish', (data) => {
         const wishText = (data && data.text) ? String(data.text).trim() : '';
         if (!wishText) return;
 
-        io.emit('dzp_receive_wish', {
+        io.to(socket.roomId).emit('dzp_receive_wish', {
             text: wishText,
             senderSocketId: socket.id,
             timestamp: Date.now()
         });
     });
 
-    // 8. Ngắt kết nối & Cập nhật số lữ khách chính xác
+    // 9. Ngắt kết nối & Cập nhật vị trí ghế và số người online trong Room
     socket.on('disconnect', () => {
+        const currentRoom = getRoomData(socket.roomId);
         let freedSeat = false;
-        seats = seats.map(s => {
+
+        currentRoom.seats = currentRoom.seats.map(s => {
             if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
                 freedSeat = true;
                 return { ...s, occupiedBy: null };
@@ -192,27 +206,30 @@ io.on('connection', (socket) => {
         });
 
         if (freedSeat) {
-            io.emit('seat-state-changed', seats);
+            io.to(socket.roomId).emit('seat-state-changed', currentRoom.seats);
         }
-        io.emit('update-online-count', getExactOnlineCount());
+        io.to(socket.roomId).emit('update-online-count', getRoomOnlineCount(socket.roomId));
     });
 
-    io.emit('update-online-count', getExactOnlineCount());
+    io.to(roomId).emit('update-online-count', getRoomOnlineCount(roomId));
 });
 
-// Định kỳ phát sóng đồng bộ nhạc
+// Định kỳ phát sóng đồng bộ nhạc theo từng Room riêng biệt
 setInterval(() => {
-    if (activePlaylist.length > 0) {
-        io.emit('audio-sync-heartbeat', {
-            trackIndex: currentTrackIndex,
-            trackStartTime: trackStartTime,
-            url: activePlaylist[currentTrackIndex]?.url || '',
-            title: activePlaylist[currentTrackIndex]?.title || ''
-        });
-    }
+    Object.keys(rooms).forEach(rId => {
+        const room = rooms[rId];
+        if (room.activePlaylist && room.activePlaylist.length > 0) {
+            io.to(rId).emit('audio-sync-heartbeat', {
+                trackIndex: room.currentTrackIndex,
+                trackStartTime: room.trackStartTime,
+                url: room.activePlaylist[room.currentTrackIndex]?.url || '',
+                title: room.activePlaylist[room.currentTrackIndex]?.title || ''
+            });
+        }
+    });
 }, 5000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.0.0 running on port ${PORT} (GMT+7 Supported)`);
+    console.log(`Zen Pond Realtime Server v10.0.3 running on port ${PORT} (Multi-Room Supported)`);
 });
