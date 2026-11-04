@@ -63,6 +63,7 @@ function safeParseInt(val, fallback) {
     return isNaN(parsed) ? fallback : parsed;
 }
 
+// 3. KIỂM TRA TRẠNG THÁI ĐÓNG/MỞ PHÒNG CHUẨN XÁC TUYỆT ĐỐI (HỖ TRỢ SCHEDULEMODE 'CLOSED' & 'OPEN')
 function checkServerRoomStatus(settings) {
     const s = settings || {};
 
@@ -77,30 +78,36 @@ function checkServerRoomStatus(settings) {
         return { isOpen: false, isClosed: true, scheduleStr: 'Tạm đóng dưỡng nuôi' };
     }
 
-    const openFromH = safeParseInt(s.openFromH, 0);
-    const openFromM = safeParseInt(s.openFromM, 0);
-    const openToH   = safeParseInt(s.openToH, 23);
-    const openToM   = safeParseInt(s.openToM, 59);
+    const fromH = safeParseInt(s.openFromH, 0);
+    const fromM = safeParseInt(s.openFromM, 0);
+    const toH   = safeParseInt(s.openToH, 23);
+    const toM   = safeParseInt(s.openToM, 59);
 
-    if ((openFromH === 0 && openFromM === 0 && openToH === 23 && openToM >= 58) ||
-        (openFromH === openToH && openFromM === openToM)) {
-        return { isOpen: true, isClosed: false, scheduleStr: 'Mở cửa cả ngày' };
-    }
+    const scheduleMode = s.scheduleMode || 'closed';
 
     const vnTime = getVietnamTimeObj();
-    const currTotal  = vnTime.hour * 60 + vnTime.minute;
-    const openTotal  = openFromH * 60 + openFromM;
-    const closeTotal = openToH * 60 + openToM + 1;
+    const currTotal = vnTime.hour * 60 + vnTime.minute;
+    const fromTotal = fromH * 60 + fromM;
+    const toTotal   = toH * 60 + toM + 1;
+
+    let isInTimeRange = false;
+    if (fromTotal < toTotal) {
+        isInTimeRange = (currTotal >= fromTotal && currTotal < toTotal);
+    } else {
+        isInTimeRange = (currTotal >= fromTotal || currTotal < toTotal);
+    }
 
     let isOpen = true;
-    if (openTotal < closeTotal) {
-        isOpen = (currTotal >= openTotal && currTotal < closeTotal);
+    if (scheduleMode === 'closed') {
+        isOpen = !isInTimeRange;
     } else {
-        isOpen = (currTotal >= openTotal || currTotal < closeTotal);
+        isOpen = isInTimeRange;
     }
 
     const pad = (n) => String(n).padStart(2, '0');
-    const scheduleStr = s.scheduleStr || `${pad(openFromH)}:${pad(openFromM)} đến ${pad(openToH)}:${pad(openToM)}`;
+    const scheduleStr = (scheduleMode === 'closed')
+        ? `Dưỡng nuôi từ ${pad(fromH)}:${pad(fromM)} đến ${pad(toH)}:${pad(toM)}`
+        : `Mở cửa từ ${pad(fromH)}:${pad(fromM)} đến ${pad(toH)}:${pad(toM)}`;
 
     return {
         isOpen: isOpen,
