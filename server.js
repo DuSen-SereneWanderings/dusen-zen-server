@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v8.0.0 Anonymous Wishing Leaves Broadcast)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v10.0.0 - 3 Sessions Schedule & GMT+7 Timezone Support)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -34,6 +34,27 @@ let lanternCounts = {
 let currentTrackIndex = 0;
 let trackStartTime = Date.now();
 let activePlaylist = [];
+
+// Hàm hỗ trợ trích xuất Giờ & Phút chuẩn múi giờ Việt Nam (Asia/Ho_Chi_Minh)
+function getVietnamTimeObj() {
+    try {
+        const now = new Date();
+        const options = { timeZone: 'Asia/Ho_Chi_Minh', hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false };
+        const formatter = new Intl.DateTimeFormat('en-US', options);
+        const parts = formatter.formatToParts(now);
+        let h = 0, m = 0, s = 0;
+        parts.forEach(p => {
+            if (p.type === 'hour') h = parseInt(p.value, 10);
+            if (p.type === 'minute') m = parseInt(p.value, 10);
+            if (p.type === 'second') s = parseInt(p.value, 10);
+        });
+        if (h === 24) h = 0;
+        return { hour: h, minute: m, second: s };
+    } catch(e) {
+        const now = new Date();
+        return { hour: now.getHours(), minute: now.getMinutes(), second: now.getSeconds() };
+    }
+}
 
 function getExactOnlineCount() {
     return io.of("/").sockets.size;
@@ -147,12 +168,11 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 7. [MỚI V8.0.0] Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime cho tất cả Lữ Khách
+    // 7. Phát sóng Thiệp Tâm Nguyện Ẩn Danh Realtime cho tất cả Lữ Khách
     socket.on('dzp_send_wish', (data) => {
         const wishText = (data && data.text) ? String(data.text).trim() : '';
         if (!wishText) return;
 
-        // Phát sóng sự kiện 'dzp_receive_wish' đến TẤT CẢ các client đang kết nối (kể cả người gửi)
         io.emit('dzp_receive_wish', {
             text: wishText,
             senderSocketId: socket.id,
@@ -180,6 +200,7 @@ io.on('connection', (socket) => {
     io.emit('update-online-count', getExactOnlineCount());
 });
 
+// Định kỳ phát sóng đồng bộ nhạc
 setInterval(() => {
     if (activePlaylist.length > 0) {
         io.emit('audio-sync-heartbeat', {
@@ -193,5 +214,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v8.0.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.0.0 running on port ${PORT} (GMT+7 Supported)`);
 });
