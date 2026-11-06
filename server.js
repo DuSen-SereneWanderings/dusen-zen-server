@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v10.0.3 - Full Multi-Room Support)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v10.0.4 - Full Multi-Room & State Sync Safe)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -9,6 +9,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
+app.use(express.json());
 app.use(cors());
 
 const server = http.createServer(app);
@@ -62,7 +63,7 @@ io.on('connection', (socket) => {
 
     const room = getRoomData(roomId);
 
-    // 2. Ghi nhớ thông tin User khi vào phòng
+    // 2. Ghi nhớ thông tin User & Đồng bộ dữ liệu thực tế từ WordPress DB
     socket.on('request-entry', (data) => {
         const userObj = typeof data === 'object' ? data : {};
         if (userObj && userObj.name) {
@@ -70,6 +71,22 @@ io.on('connection', (socket) => {
             socket.userAvatar = userObj.avatar || '';
         } else {
             socket.userName = 'Lữ khách';
+        }
+
+        // AN TOÀN: Đồng bộ số tim từ DB (PHP truyền sang) nếu lớn hơn số trong RAM Node.js
+        if (typeof userObj.initialHearts === 'number' && userObj.initialHearts > room.totalHearts) {
+            room.totalHearts = userObj.initialHearts;
+        }
+
+        // AN TOÀN: Đồng bộ số hoa đăng từ DB nếu lớn hơn số trong RAM Node.js
+        if (userObj.initialLanterns && typeof userObj.initialLanterns === 'object') {
+            Object.keys(userObj.initialLanterns).forEach(w => {
+                const countFromDb = parseInt(userObj.initialLanterns[w], 10) || 0;
+                const currentRamCount = room.lanternCounts[w] || 0;
+                if (countFromDb > currentRamCount) {
+                    room.lanternCounts[w] = countFromDb;
+                }
+            });
         }
 
         const occupiedCount = room.seats.filter(s => s.occupiedBy !== null).length;
@@ -82,21 +99,21 @@ io.on('connection', (socket) => {
             maxSeats: MAX_SEATS,
             seats: room.seats
         });
-        
-        io.to(roomId).emit('update-online-count', getRoomOnlineCount(roomId));
-    });
 
-    // 3. Gửi trạng thái khởi tạo cho Client vừa kết nối
-    socket.emit('init-state', {
-        seats: room.seats,
-        totalHearts: room.totalHearts,
-        lanternCounts: room.lanternCounts,
-        audioState: {
-            trackIndex: room.currentTrackIndex,
-            trackStartTime: room.trackStartTime,
-            url: room.activePlaylist[room.currentTrackIndex]?.url || '',
-            title: room.activePlaylist[room.currentTrackIndex]?.title || ''
-        }
+        // 3. Gửi trạng thái khởi tạo chuẩn xác cho Client vừa kết nối (sau khi đã Sync dữ liệu)
+        socket.emit('init-state', {
+            seats: room.seats,
+            totalHearts: room.totalHearts,
+            lanternCounts: room.lanternCounts,
+            audioState: {
+                trackIndex: room.currentTrackIndex,
+                trackStartTime: room.trackStartTime,
+                url: room.activePlaylist[room.currentTrackIndex]?.url || '',
+                title: room.activePlaylist[room.currentTrackIndex]?.title || ''
+            }
+        });
+
+        io.to(roomId).emit('update-online-count', getRoomOnlineCount(roomId));
     });
 
     // 4. Đăng ký nhận vị trí (Claim Seat)
@@ -150,7 +167,14 @@ io.on('connection', (socket) => {
     // 6. Gửi Thương Realtime theo Room
     socket.on('send-heart', (data) => {
         const currentRoom = getRoomData(socket.roomId);
-        currentRoom.totalHearts++;
+        
+        // Cập nhật nếu Client truyền con số mới nhất từ DB AJAX về, nếu không thì tự tăng 1
+        if (data && typeof data.totalHearts === 'number' && data.totalHearts > currentRoom.totalHearts) {
+            currentRoom.totalHearts = data.totalHearts;
+        } else {
+            currentRoom.totalHearts++;
+        }
+
         const senderName = (data && data.userName) || socket.userName || 'Lữ khách';
 
         io.to(socket.roomId).emit('heart-broadcast', {
@@ -168,7 +192,13 @@ io.on('connection', (socket) => {
         if (!currentRoom.lanternCounts[word]) {
             currentRoom.lanternCounts[word] = 0;
         }
-        currentRoom.lanternCounts[word]++;
+
+        if (data && data.lanternCounts && typeof data.lanternCounts[word] === 'number' && data.lanternCounts[word] > currentRoom.lanternCounts[word]) {
+            currentRoom.lanternCounts[word] = data.lanternCounts[word];
+        } else {
+            currentRoom.lanternCounts[word]++;
+        }
+
         const senderName = (data && data.userName) || socket.userName || 'Lữ khách';
 
         io.to(socket.roomId).emit('lantern-broadcast', {
@@ -180,7 +210,7 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 8. Phát sóng Lá Tâm Nguyệt Realtime theo Room
+    // 8. Phát sóng Lá Tâm Nguyện Realtime theo Room
     socket.on('dzp_send_wish', (data) => {
         const wishText = (data && data.text) ? String(data.text).trim() : '';
         if (!wishText) return;
@@ -231,5 +261,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.0.3 running on port ${PORT} (Multi-Room Supported)`);
+    console.log(`Zen Pond Realtime Server v10.0.4 running on port ${PORT} (Multi-Room & State Sync Safe)`);
 });
