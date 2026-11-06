@@ -1,5 +1,5 @@
 /**
- * Du Sen Zen Pond - Realtime Socket.io Server (v10.0.4 - Full Multi-Room & State Sync Safe)
+ * Du Sen Zen Pond - Realtime Socket.io Server (v10.3.0 - Dynamic Seats & Multi-Room Safe)
  * GitHub Repo Server code for Render deployment
  */
 
@@ -20,17 +20,29 @@ const io = new Server(server, {
     }
 });
 
-const MAX_SEATS = 17;
+// 1. CẤU HÌNH SỐ LƯỢNG CHỖ NGỒI THEO TỪNG PHÒNG
+const ROOM_SEATS_LIMIT = {
+    'main': 17,
+    'room_2': 37  // Đã nâng phòng 2 lên 37 chỗ
+};
 
 // LƯU TRỮ TRẠNG THÁI THEO TỪNG ROOM ID
 const rooms = {};
+
+// Hàm lấy giới hạn số chỗ của 1 phòng (Mặc định 17 nếu là phòng khác)
+function getRoomMaxSeats(roomId) {
+    const rId = roomId || 'main';
+    return ROOM_SEATS_LIMIT[rId] || 17;
+}
 
 // Hàm lấy hoặc khởi tạo dữ liệu cho một phòng
 function getRoomData(roomId) {
     const rId = roomId || 'main';
     if (!rooms[rId]) {
+        const maxSeats = getRoomMaxSeats(rId);
         rooms[rId] = {
-            seats: Array.from({ length: MAX_SEATS }, (_, i) => ({
+            maxSeats: maxSeats,
+            seats: Array.from({ length: maxSeats }, (_, i) => ({
                 id: i + 1,
                 occupiedBy: null
             })),
@@ -90,13 +102,13 @@ io.on('connection', (socket) => {
         }
 
         const occupiedCount = room.seats.filter(s => s.occupiedBy !== null).length;
-        const availableSeats = MAX_SEATS - occupiedCount;
+        const availableSeats = room.maxSeats - occupiedCount;
         const isFull = availableSeats <= 0;
 
         socket.emit('entry-status-checked', {
             isFull: isFull,
             availableSeats: availableSeats,
-            maxSeats: MAX_SEATS,
+            maxSeats: room.maxSeats,
             seats: room.seats
         });
 
@@ -168,7 +180,6 @@ io.on('connection', (socket) => {
     socket.on('send-heart', (data) => {
         const currentRoom = getRoomData(socket.roomId);
         
-        // Cập nhật nếu Client truyền con số mới nhất từ DB AJAX về, nếu không thì tự tăng 1
         if (data && typeof data.totalHearts === 'number' && data.totalHearts > currentRoom.totalHearts) {
             currentRoom.totalHearts = data.totalHearts;
         } else {
@@ -261,5 +272,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.0.4 running on port ${PORT} (Multi-Room & State Sync Safe)`);
+    console.log(`Zen Pond Realtime Server v10.3.0 running on port ${PORT} (Dynamic Seats: Room 2 = 37)`);
 });
