@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.3.3 - Fixed Type Mismatch & Dynamic Room & Multi-Seat Bug Fix
+ * v10.3.4 - Robust Seat Claim & Dynamic ID Parsing & Multi-attribute User Fix
  * GitHub Repo Server code for Render deployment
  */
 
@@ -134,7 +134,6 @@ io.on('connection', (socket) => {
     socket.roomId = currentRoomId;
     socket.join(currentRoomId);
 
-    // Hàm hỗ trợ đồng bộ RoomID từ dữ liệu sự kiện gửi lên
     function syncSocketRoom(incomingRoomId) {
         if (incomingRoomId && incomingRoomId !== socket.roomId) {
             socket.leave(socket.roomId);
@@ -149,8 +148,8 @@ io.on('connection', (socket) => {
         const targetRoomId = userObj.roomId || socket.roomId || 'main';
         syncSocketRoom(targetRoomId);
 
-        socket.userName = userObj.name || 'Lữ khách';
-        socket.userAvatar = userObj.avatar || '';
+        socket.userName = userObj.name || userObj.userName || 'Lữ khách';
+        socket.userAvatar = userObj.avatar || userObj.userAvatar || '';
 
         applyRoomSession(socket.roomId, userObj.sessionKey);
 
@@ -187,20 +186,38 @@ io.on('connection', (socket) => {
         applyRoomSession(socket.roomId, data.sessionKey);
     });
 
-    // 7. ĐĂNG KÝ NHẬN VỊ TRÍ (CLAIM SEAT) - ĐÃ SỬA LỖI ÉP KIỂU & TRÙNG GhẾ
+    // 7. ĐĂNG KÝ NHẬN VỊ TRÍ (CLAIM SEAT) - ĐÃ ĐƯỢC TỐI ƯU HÓA HOÀN TOÀN
     socket.on('claim-seat', (data) => {
         const targetRoomId = (typeof data === 'object' && data.roomId) ? data.roomId : socket.roomId;
         syncSocketRoom(targetRoomId);
 
-        // Ép kiểu seatId về Int chuẩn
         const rawSeatId = typeof data === 'object' ? data.seatId : data;
-        const seatId = parseInt(rawSeatId, 10);
+        
+        // Trích xuất số nguyên kể cả khi client gửi "seat-1", "seat_5", hoặc số 1
+        let seatId = NaN;
+        if (typeof rawSeatId === 'number') {
+            seatId = rawSeatId;
+        } else if (typeof rawSeatId === 'string') {
+            const extractedNum = rawSeatId.replace(/\D/g, '');
+            if (extractedNum !== '') {
+                seatId = parseInt(extractedNum, 10);
+            }
+        }
 
-        if (isNaN(seatId)) return;
+        if (isNaN(seatId)) {
+            console.warn(`[Zen Pond] Warning: Invalid seatId received:`, rawSeatId);
+            return;
+        }
+
+        // Đồng bộ dữ liệu tên & avatar nếu Client gửi kèm trong claim-seat
+        if (typeof data === 'object') {
+            if (data.name || data.userName) socket.userName = data.name || data.userName;
+            if (data.avatar || data.userAvatar) socket.userAvatar = data.avatar || data.userAvatar;
+        }
 
         const currentRoom = getRoomData(socket.roomId);
 
-        // 1. Giải phóng ghế cũ của chính Client này trong phòng
+        // 1. Giải phóng ghế cũ của chính Client này trong phòng hiện tại
         currentRoom.seats = currentRoom.seats.map(s => {
             if (s.occupiedBy && s.occupiedBy.socketId === socket.id) {
                 return { ...s, occupiedBy: null };
@@ -208,18 +225,24 @@ io.on('connection', (socket) => {
             return s;
         });
 
-        // 2. Tìm ghế mục tiêu (So sánh kiểu Number với Number)
-        const targetIndex = currentRoom.seats.findIndex(s => s.id === seatId);
+        // 2. Tìm ghế mục tiêu (Hỗ trợ cả 1-indexed id:1..N và 0-indexed index:0..N-1)
+        let targetIndex = currentRoom.seats.findIndex(s => s.id === seatId);
+        if (targetIndex === -1 && seatId >= 0 && seatId < currentRoom.seats.length) {
+            targetIndex = seatId; // Fallback nếu client gửi mảng số thứ tự 0-indexed
+        }
 
         if (targetIndex !== -1 && !currentRoom.seats[targetIndex].occupiedBy) {
             currentRoom.seats[targetIndex].occupiedBy = {
                 socketId: socket.id,
-                name: socket.userName || (typeof data === 'object' && data.userName) || 'Lữ khách',
+                name: socket.userName || 'Lữ khách',
                 avatar: socket.userAvatar || ''
             };
+            console.log(`[Zen Pond] Seat claimed: Seat ${currentRoom.seats[targetIndex].id} in room '${socket.roomId}' by '${socket.userName}' (${socket.id})`);
+        } else {
+            console.warn(`[Zen Pond] Claim failed: Seat ${seatId} in room '${socket.roomId}' is occupied or not found.`);
         }
 
-        // 3. Broadcast lại mảng ghế chính xác cho TOÀN BỘ người trong phòng
+        // 3. Broadcast lại mảng ghế mới cho TOÀN BỘ Client trong phòng
         io.to(socket.roomId).emit('seat-state-changed', currentRoom.seats);
     });
 
@@ -255,7 +278,7 @@ io.on('connection', (socket) => {
         const currentRoom = getRoomData(socket.roomId);
         currentRoom.totalHearts++;
 
-        const senderName = (data && data.userName) || socket.userName || 'Lữ khách';
+        const senderName = (data && (data.userName || data.name)) || socket.userName || 'Lữ khách';
 
         io.to(socket.roomId).emit('heart-broadcast', {
             seatId: data ? data.seatId : null,
@@ -277,7 +300,7 @@ io.on('connection', (socket) => {
         }
         currentRoom.lanternCounts[word]++;
 
-        const senderName = (data && data.userName) || socket.userName || 'Lữ khách';
+        const senderName = (data && (data.userName || data.name)) || socket.userName || 'Lữ khách';
 
         io.to(socket.roomId).emit('lantern-broadcast', {
             seatId: data ? data.seatId : null,
@@ -338,5 +361,5 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.3.3 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.3.4 running on port ${PORT}`);
 });
