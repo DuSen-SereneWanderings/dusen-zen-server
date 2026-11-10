@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.0 - Verified Account Identity, Single Seat & Reconnect Grace
+ * v10.4.1 - Verified Identity, Single Seat & Authoritative Audio Sync
  * GitHub Repo Server code for Render deployment
  */
 
@@ -53,7 +53,8 @@ function getRoomData(roomId) {
             sessionKey: null,
             currentTrackIndex: 0,
             trackStartTime: Date.now(),
-            activePlaylist: []
+            activePlaylist: [],
+            playlistFingerprint: ''
         };
     }
     return rooms[rId];
@@ -467,28 +468,74 @@ io.on('connection', (socket) => {
         if (typeof acknowledge === 'function') acknowledge({ ok: true });
     });
 
+    // Playlist được khởi tạo một lần cho mỗi phòng. Thiết bị kết nối sau
+    // không thể ghi đè danh sách phát đang được cả phòng sử dụng.
     socket.on('sync-playlist', (data) => {
         if (socket.identityBlocked) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
+
         const currentRoom = getRoomData(socket.roomId);
-        if (data && Array.isArray(data.playlist) && data.playlist.length > 0) currentRoom.activePlaylist = data.playlist;
+        if (!data || !Array.isArray(data.playlist) || data.playlist.length === 0) return;
+        if (currentRoom.activePlaylist.length > 0) return;
+
+        const normalizedPlaylist = data.playlist.map((item) => {
+            if (!item || typeof item !== 'object') return null;
+            const url = String(item.url || '').trim();
+            if (!/^https?:\/\//i.test(url)) return null;
+            return {
+                url: url.slice(0, 2048),
+                title: String(item.title || 'Du Sen').trim().slice(0, 200)
+            };
+        }).filter(Boolean);
+
+        if (!normalizedPlaylist.length) return;
+        currentRoom.activePlaylist = normalizedPlaylist;
+        currentRoom.currentTrackIndex = 0;
+        // Bắt đầu mốc thời gian tại lúc playlist chuẩn được khởi tạo,
+        // tránh tính nhầm thời gian từ lúc room object được tạo trước đó.
+        currentRoom.trackStartTime = Date.now();
+        currentRoom.playlistFingerprint = crypto.createHash('sha256')
+            .update(JSON.stringify(normalizedPlaylist)).digest('hex');
+
+        // Phát trạng thái chuẩn ngay khi playlist đầu tiên được đăng ký.
+        const firstTrack = currentRoom.activePlaylist[currentRoom.currentTrackIndex];
+        io.to(socket.roomId).emit('sync-audio-track', {
+            trackIndex: currentRoom.currentTrackIndex,
+            trackStartTime: currentRoom.trackStartTime,
+            url: firstTrack.url,
+            title: firstTrack.title
+        });
+        console.log(`[Zen Pond] Audio playlist initialized: room '${socket.roomId}' (${normalizedPlaylist.length} tracks)`);
     });
 
+    // Chỉ chấp nhận một lần kết thúc cho đúng phiên phát hiện tại.
+    // Mọi thiết bị gửi cùng trackIndex + trackStartTime; sau lần đầu,
+    // trackStartTime đổi nên các sự kiện đến trễ đều bị loại bỏ.
     socket.on('track-ended', (data) => {
         if (socket.identityBlocked) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
+
         const currentRoom = getRoomData(socket.roomId);
-        const endedIndex = typeof data === 'object' && data ? data.trackIndex : data;
-        if (currentRoom.activePlaylist.length === 0) return;
-        currentRoom.currentTrackIndex = (Number(endedIndex) + 1) % currentRoom.activePlaylist.length;
+        if (!data || typeof data !== 'object' || currentRoom.activePlaylist.length === 0) return;
+
+        const endedIndex = Number(data.trackIndex);
+        const endedStartTime = Number(data.trackStartTime);
+        if (!Number.isInteger(endedIndex) || endedIndex !== currentRoom.currentTrackIndex) return;
+        if (!Number.isFinite(endedStartTime) || endedStartTime !== Number(currentRoom.trackStartTime)) return;
+
+        const nextIndex = (currentRoom.currentTrackIndex + 1) % currentRoom.activePlaylist.length;
+        const nextTrack = currentRoom.activePlaylist[nextIndex];
+        if (!nextTrack || !nextTrack.url) return;
+
+        currentRoom.currentTrackIndex = nextIndex;
         currentRoom.trackStartTime = Date.now();
         io.to(socket.roomId).emit('sync-audio-track', {
             trackIndex: currentRoom.currentTrackIndex,
             trackStartTime: currentRoom.trackStartTime,
-            url: currentRoom.activePlaylist[currentRoom.currentTrackIndex].url,
-            title: currentRoom.activePlaylist[currentRoom.currentTrackIndex].title
+            url: nextTrack.url,
+            title: nextTrack.title
         });
     });
 
@@ -583,7 +630,7 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.4.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.4.1 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
