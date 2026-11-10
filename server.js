@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.2 - Verified Identity, Seat Snapshot & Authoritative Audio Sync
+ * v10.4.4 - Session Lifecycle, Room-Scoped Entry Lock & Authoritative Audio Sync
  * GitHub Repo Server code for Render deployment
  */
 
@@ -32,6 +32,9 @@ const ROOM_SEATS_LIMIT = {
 const DISCONNECT_GRACE_MS = 30 * 1000;
 const IDENTITY_SECRET = String(process.env.DZP_SOCKET_IDENTITY_SECRET || '');
 const seatReleaseTimers = new Map();
+// Khóa phiên tham gia theo từng tài khoản + từng phòng, không khóa đăng nhập toàn website.
+const roomEntryOwners = new Map();
+const roomEntryReleaseTimers = new Map();
 
 // LƯU TRỮ TRẠNG THÁI THEO TỪNG ROOM ID
 const rooms = {};
@@ -51,6 +54,11 @@ function getRoomData(roomId) {
             totalHearts: 0,
             lanternCounts: { 'An yên': 0, 'Bình an': 0, 'Biết ơn': 0 },
             sessionKey: null,
+            sessionEndAt: 0,
+            sessionEnding: false,
+            sessionClosed: false,
+            sessionEndTimer: null,
+            sessionForceExitTimer: null,
             currentTrackIndex: 0,
             trackStartTime: Date.now(),
             activePlaylist: [],
@@ -173,6 +181,80 @@ function releaseSocketSeat(roomId, socketId) {
     return changed;
 }
 
+function getRoomEntryKey(roomId, identityKey) {
+    return `${roomId || 'main'}:${identityKey || ''}`;
+}
+
+function releaseRoomEntry(roomId, socketId) {
+    if (!roomId || !socketId) return;
+    const prefix = `${roomId}:`;
+    for (const [key, owner] of roomEntryOwners.entries()) {
+        if (key.startsWith(prefix) && owner.socketId === socketId) {
+            const timer = roomEntryReleaseTimers.get(key);
+            if (timer) clearTimeout(timer);
+            roomEntryReleaseTimers.delete(key);
+            roomEntryOwners.delete(key);
+        }
+    }
+}
+
+function reserveRoomEntry(socket, roomId) {
+    const key = getRoomEntryKey(roomId, socket.identityKey);
+    const owner = roomEntryOwners.get(key);
+    if (!owner || owner.socketId === socket.id) {
+        roomEntryOwners.set(key, { socketId: socket.id, deviceId: socket.deviceId, disconnectedAt: 0 });
+        return { allowed: true };
+    }
+
+    const ownerSocket = io.sockets.sockets.get(owner.socketId);
+    if (ownerSocket && ownerSocket.connected) {
+        // Cùng deviceId (ví dụ mở lại tab trên cùng trình duyệt) không phải thiết bị khác.
+        if (owner.deviceId && owner.deviceId === socket.deviceId) {
+            ownerSocket.identityBlocked = true;
+            ownerSocket.mySeatId = null;
+            ownerSocket.emit('same-device-session-replaced', {});
+            roomEntryOwners.set(key, { socketId: socket.id, deviceId: socket.deviceId, disconnectedAt: 0 });
+            return { allowed: true, replacedSameDevice: true };
+        }
+        return { allowed: false, reason: 'active' };
+    }
+
+    const disconnectedAt = Number(owner.disconnectedAt || 0);
+    const withinGrace = disconnectedAt > 0 && (Date.now() - disconnectedAt) < DISCONNECT_GRACE_MS;
+    if (withinGrace && owner.deviceId === socket.deviceId) {
+        const timer = roomEntryReleaseTimers.get(key);
+        if (timer) clearTimeout(timer);
+        roomEntryReleaseTimers.delete(key);
+        roomEntryOwners.set(key, { socketId: socket.id, deviceId: socket.deviceId, disconnectedAt: 0 });
+        return { allowed: true, reclaimed: true };
+    }
+    if (withinGrace) return { allowed: false, reason: 'grace' };
+
+    const timer = roomEntryReleaseTimers.get(key);
+    if (timer) clearTimeout(timer);
+    roomEntryReleaseTimers.delete(key);
+    roomEntryOwners.set(key, { socketId: socket.id, deviceId: socket.deviceId, disconnectedAt: 0 });
+    return { allowed: true };
+}
+
+function markRoomEntryDisconnected(socket) {
+    for (const [key, owner] of roomEntryOwners.entries()) {
+        if (owner.socketId !== socket.id) continue;
+        const disconnectedAt = Date.now();
+        owner.disconnectedAt = disconnectedAt;
+        const previousTimer = roomEntryReleaseTimers.get(key);
+        if (previousTimer) clearTimeout(previousTimer);
+        const timer = setTimeout(() => {
+            const latest = roomEntryOwners.get(key);
+            if (latest && latest.socketId === socket.id && latest.disconnectedAt === disconnectedAt) {
+                roomEntryOwners.delete(key);
+                roomEntryReleaseTimers.delete(key);
+            }
+        }, DISCONNECT_GRACE_MS);
+        roomEntryReleaseTimers.set(key, timer);
+    }
+}
+
 function showDuplicateSession(socket, message) {
     socket.identityBlocked = true;
     if (socket.duplicateNoticeSent) return;
@@ -207,6 +289,16 @@ function resolveExistingUserSeat(socket, roomId) {
 
     const previousSocket = io.sockets.sockets.get(owner.socketId);
     if (previousSocket && previousSocket.connected) {
+        if (owner.deviceId && owner.deviceId === socket.deviceId) {
+            previousSocket.identityBlocked = true;
+            previousSocket.mySeatId = null;
+            previousSocket.emit('same-device-session-replaced', {});
+            owner.socketId = socket.id;
+            owner.disconnectedAt = 0;
+            socket.mySeatId = existingSeat.id;
+            emitSeatState(roomId);
+            return { allowed: true, reclaimed: true, seatId: existingSeat.id };
+        }
         return { allowed: false, reason: 'active', seatId: existingSeat.id };
     }
 
@@ -250,6 +342,114 @@ function getSessionStartTimestamp(sessionKey) {
     return Date.UTC(year, month - 1, day, hour, minute);
 }
 
+function getSessionEndTimestamp(sessionKey) {
+    if (typeof sessionKey !== 'string') return null;
+    const parts = sessionKey.split('|');
+    if (parts.length !== 4) return null;
+
+    const dateMatch = parts[1].match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const openMatch = parts[2].match(/^(\d{2}):(\d{2})$/);
+    const closeMatch = parts[3].match(/^(\d{2}):(\d{2})$/);
+    if (!dateMatch || !openMatch || !closeMatch) return null;
+
+    const year = Number(dateMatch[1]);
+    const month = Number(dateMatch[2]);
+    const day = Number(dateMatch[3]);
+    const openHour = Number(openMatch[1]);
+    const openMinute = Number(openMatch[2]);
+    const closeHour = Number(closeMatch[1]);
+    const closeMinute = Number(closeMatch[2]);
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        openHour > 23 || openMinute > 59 || closeHour > 23 || closeMinute > 59) return null;
+
+    const openMinutes = openHour * 60 + openMinute;
+    const closeMinutes = closeHour * 60 + closeMinute;
+    const closeDate = new Date(Date.UTC(year, month - 1, day));
+    if (openMinutes >= closeMinutes) closeDate.setUTCDate(closeDate.getUTCDate() + 1);
+
+    // Lịch phiên được cấu hình theo giờ Việt Nam (UTC+7).
+    return Date.UTC(
+        closeDate.getUTCFullYear(), closeDate.getUTCMonth(), closeDate.getUTCDate(),
+        closeHour, closeMinute
+    ) - (7 * 60 * 60 * 1000);
+}
+
+function clearRoomSessionTimers(room) {
+    if (room.sessionEndTimer) clearTimeout(room.sessionEndTimer);
+    if (room.sessionForceExitTimer) clearTimeout(room.sessionForceExitTimer);
+    room.sessionEndTimer = null;
+    room.sessionForceExitTimer = null;
+}
+
+function releaseAllRoomEntryOwners(roomId) {
+    const prefix = `${roomId}:`;
+    for (const [key, owner] of roomEntryOwners.entries()) {
+        if (!key.startsWith(prefix)) continue;
+        const timer = roomEntryReleaseTimers.get(key);
+        if (timer) clearTimeout(timer);
+        roomEntryReleaseTimers.delete(key);
+        roomEntryOwners.delete(key);
+    }
+}
+
+function forceEndRoomSession(roomId, expectedSessionKey) {
+    const rId = roomId || 'main';
+    const room = getRoomData(rId);
+    if (room.sessionKey !== expectedSessionKey || room.sessionClosed) return;
+
+    room.sessionClosed = true;
+    clearRoomSessionTimers(room);
+
+    room.seats.forEach(seat => {
+        clearSeatReleaseTimer(rId, seat.id);
+        seat.occupiedBy = null;
+    });
+    releaseAllRoomEntryOwners(rId);
+
+    // Thông báo cho toàn bộ trình duyệt trước khi tách socket khỏi phòng.
+    emitSeatState(rId);
+    io.to(rId).emit('session-force-exit', {
+        roomId: rId,
+        sessionKey: expectedSessionKey,
+        message: 'Phiên đã khép lại. Không gian Du Sen hẹn gặp lại bạn trong phiên tiếp theo.'
+    });
+    io.to(rId).emit('update-online-count', 0);
+
+    const members = Array.from(io.sockets.adapter.rooms.get(rId) || []);
+    members.forEach(socketId => {
+        const memberSocket = io.sockets.sockets.get(socketId);
+        if (memberSocket) {
+            memberSocket.mySeatId = null;
+            memberSocket.leave(rId);
+        }
+    });
+
+    console.log(`[Zen Pond] Session force-closed: ${rId} | ${expectedSessionKey}`);
+}
+
+function scheduleRoomSessionEnd(roomId, sessionKey, endAt) {
+    const rId = roomId || 'main';
+    const room = getRoomData(rId);
+    const announceDelay = Math.max(0, endAt - Date.now());
+
+    room.sessionEndTimer = setTimeout(() => {
+        if (room.sessionKey !== sessionKey || room.sessionClosed || room.sessionEnding) return;
+        room.sessionEnding = true;
+        io.to(rId).emit('session-ending', {
+            roomId: rId,
+            sessionKey,
+            endsAt: endAt,
+            message: 'Phiên an tọa đã đến giờ kết thúc. Cảm ơn bạn đã cùng Du Sen giữ gìn khoảng lặng. Không gian sẽ khép lại sau 1 phút.'
+        });
+        console.log(`[Zen Pond] Session ending notice: ${rId} | ${sessionKey}`);
+
+        const forceDelay = Math.max(0, endAt + 60000 - Date.now());
+        room.sessionForceExitTimer = setTimeout(() => {
+            forceEndRoomSession(rId, sessionKey);
+        }, forceDelay);
+    }, announceDelay);
+}
+
 function applyRoomSession(roomId, sessionKey) {
     const rId = roomId || 'main';
     if (typeof sessionKey !== 'string' || !sessionKey.trim()) return false;
@@ -257,16 +457,24 @@ function applyRoomSession(roomId, sessionKey) {
     const parts = normalizedKey.split('|');
     if (parts.length !== 4 || parts[0] !== rId) return false;
     const incomingTimestamp = getSessionStartTimestamp(normalizedKey);
-    if (incomingTimestamp === null) return false;
+    const endAt = getSessionEndTimestamp(normalizedKey);
+    if (incomingTimestamp === null || endAt === null) return false;
 
     const room = getRoomData(rId);
     if (room.sessionKey === normalizedKey) return false;
+    // Do not let a new session cancel the previous session's one-minute closure window.
+    if (room.sessionKey && room.sessionEndAt && Date.now() >= room.sessionEndAt && !room.sessionClosed) return false;
+    if (room.sessionEnding && !room.sessionClosed) return false;
     if (room.sessionKey) {
         const currentTimestamp = getSessionStartTimestamp(room.sessionKey);
         if (currentTimestamp !== null && incomingTimestamp < currentTimestamp) return false;
     }
 
+    clearRoomSessionTimers(room);
     room.sessionKey = normalizedKey;
+    room.sessionEndAt = endAt;
+    room.sessionEnding = false;
+    room.sessionClosed = false;
     room.totalHearts = 0;
     Object.keys(room.lanternCounts).forEach(word => { room.lanternCounts[word] = 0; });
     io.to(rId).emit('session-counters-reset', {
@@ -274,7 +482,8 @@ function applyRoomSession(roomId, sessionKey) {
         totalHearts: 0,
         lanternCounts: { ...room.lanternCounts }
     });
-    console.log(`[Zen Pond] New session: ${rId} | ${normalizedKey} | Counters reset`);
+    scheduleRoomSessionEnd(rId, normalizedKey, endAt);
+    console.log(`[Zen Pond] New session: ${rId} | ${normalizedKey} | Counters reset | Ends ${new Date(endAt).toISOString()}`);
     return true;
 }
 
@@ -293,18 +502,24 @@ io.on('connection', (socket) => {
     socket.duplicateNoticeSent = false;
 
     function syncSocketRoom(incomingRoomId) {
-        if (incomingRoomId && incomingRoomId !== socket.roomId) {
+        const targetRoomId = incomingRoomId || socket.roomId || 'main';
+        if (targetRoomId !== socket.roomId) {
+            releaseRoomEntry(socket.roomId, socket.id);
             socket.leave(socket.roomId);
-            socket.roomId = incomingRoomId;
-            socket.join(incomingRoomId);
+            socket.roomId = targetRoomId;
             socket.identityBlocked = false;
             socket.duplicateNoticeSent = false;
             socket.mySeatId = null;
         }
+        // Session closure can remove a socket from the room without disconnecting it.
+        // Rejoin only after an explicit request-entry from the user.
+        const members = io.sockets.adapter.rooms.get(targetRoomId);
+        if (!members || !members.has(socket.id)) socket.join(targetRoomId);
     }
 
     // 5. NHẬN YÊU CẦU VÀO KHÔNG GIAN
-    socket.on('request-entry', (data) => {
+    socket.on('request-entry', (data, acknowledge) => {
+        const reply = (payload) => { if (typeof acknowledge === 'function') acknowledge(payload); };
         const userObj = typeof data === 'object' && data !== null ? data : {};
         const targetRoomId = userObj.roomId || socket.roomId || 'main';
         syncSocketRoom(targetRoomId);
@@ -319,18 +534,18 @@ io.on('connection', (socket) => {
         }
         if (!socket.userId || !socket.identityKey || !IDENTITY_SECRET) {
             socket.identityBlocked = true;
-            socket.emit('identity-auth-required', {
-                message: 'Không thể xác thực tài khoản Du Sen. Vui lòng tải lại trang hoặc đăng nhập lại trước khi chọn chỗ ngồi.'
-            });
+            const message = 'Không thể xác thực tài khoản Du Sen. Vui lòng tải lại trang hoặc đăng nhập lại trước khi chọn chỗ ngồi.';
+            socket.emit('identity-auth-required', { message });
+            reply({ ok: false, code: 'identity-auth-required', message });
             return;
         }
 
         socket.deviceId = cleanDeviceId(userObj.deviceId || socket.deviceId);
         if (!socket.deviceId) {
             socket.identityBlocked = true;
-            socket.emit('identity-auth-required', {
-                message: 'Trình duyệt chưa tạo được mã thiết bị an toàn. Vui lòng bật bộ nhớ trình duyệt và tải lại trang.'
-            });
+            const message = 'Trình duyệt chưa tạo được mã thiết bị an toàn. Vui lòng bật bộ nhớ trình duyệt và tải lại trang.';
+            socket.emit('identity-auth-required', { message });
+            reply({ ok: false, code: 'device-id-missing', message });
             return;
         }
 
@@ -339,16 +554,34 @@ io.on('connection', (socket) => {
         const wasIdentityBlocked = socket.identityBlocked;
         socket.identityBlocked = false;
 
+        // The first accepted entrant registers this room's session end with the server.
+        if (userObj.sessionKey) applyRoomSession(socket.roomId, userObj.sessionKey);
+        const roomSession = getRoomData(socket.roomId);
+        if (roomSession.sessionEnding || roomSession.sessionClosed ||
+            (roomSession.sessionEndAt && Date.now() >= roomSession.sessionEndAt)) {
+            const message = 'Phiên hiện tại đã kết thúc. Vui lòng chờ đến khung giờ mở cửa tiếp theo.';
+            reply({ ok: false, code: 'session-ended', message });
+            socket.emit('session-force-exit', {
+                roomId: socket.roomId,
+                sessionKey: roomSession.sessionKey,
+                message
+            });
+            socket.leave(socket.roomId);
+            return;
+        }
+
         const existing = resolveExistingUserSeat(socket, socket.roomId);
-        if (!existing.allowed) {
-            // Vẫn gửi trạng thái ghế để client vẽ đầy đủ người đang có mặt.
-            // Client này không được claim-seat; snapshot chỉ phục vụ hiển thị.
+        const roomEntry = existing.allowed ? reserveRoomEntry(socket, socket.roomId) : { allowed: false, reason: existing.reason };
+        if (!existing.allowed || !roomEntry.allowed) {
+            // Snapshot chỉ để vẽ trạng thái phòng; không cấp quyền tham gia.
             sendRoomInitialState(socket, socket.roomId);
 
-            const message = existing.reason === 'grace'
+            const reason = !existing.allowed ? existing.reason : roomEntry.reason;
+            const message = reason === 'grace'
                 ? 'Tài khoản của bạn vừa mất kết nối trên một thiết bị khác. Vui lòng chờ tối đa 30 giây để hệ thống xác nhận phiên cũ đã kết thúc rồi thử lại.'
-                : 'Bạn đang tham gia không gian trên một thiết bị khác. Vui lòng tiếp tục sử dụng thiết bị đang giữ chỗ ngồi hiện tại.';
+                : 'Tài khoản của bạn đang tham gia không gian này trên một thiết bị khác. Vui lòng tiếp tục trên thiết bị đang sử dụng phòng.';
             showDuplicateSession(socket, message);
+            reply({ ok: false, code: 'duplicate-session', message });
             io.to(socket.roomId).emit('update-online-count', getRoomOnlineCount(socket.roomId));
             return;
         }
@@ -356,16 +589,56 @@ io.on('connection', (socket) => {
         socket.duplicateNoticeSent = false;
         if (wasIdentityBlocked) socket.emit('identity-session-available', {});
 
-        applyRoomSession(socket.roomId, userObj.sessionKey);
         sendRoomInitialState(socket, socket.roomId);
+        reply({ ok: true });
         io.to(socket.roomId).emit('update-online-count', getRoomOnlineCount(socket.roomId));
     });
 
     socket.on('session-sync', (data) => {
         if (!data || !data.sessionKey || socket.identityBlocked) return;
-        if (data.roomId) syncSocketRoom(data.roomId);
-        if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
+        // Legacy clients may still emit this event. It must never roll an active
+        // room into a new session; only an explicit request-entry can do that.
+        if (data.roomId && data.roomId !== socket.roomId) return;
+        const hasRoomEntry = Array.from(roomEntryOwners.values()).some(owner => owner.socketId === socket.id);
+        if (!hasRoomEntry) return;
+        const room = getRoomData(socket.roomId);
+        if (room.sessionKey && room.sessionKey !== data.sessionKey) return;
         applyRoomSession(socket.roomId, data.sessionKey);
+        if (room.sessionClosed) {
+            socket.emit('session-force-exit', { roomId: socket.roomId, sessionKey: room.sessionKey });
+        } else if (room.sessionEnding) {
+            socket.emit('session-ending', {
+                roomId: socket.roomId,
+                sessionKey: room.sessionKey,
+                endsAt: room.sessionEndAt,
+                message: 'Phiên an tọa đã đến giờ kết thúc. Cảm ơn bạn đã cùng Du Sen giữ gìn khoảng lặng. Không gian sẽ khép lại sau 1 phút.'
+            });
+        }
+    });
+
+    // Reconnect-only lifecycle recovery. This never claims/reclaims a seat or
+    // reserves room entry; it only restores the server timer for the same session.
+    socket.on('session-watch', (data) => {
+        if (!data || !data.sessionKey || socket.identityBlocked || !socket.userId) return;
+        if (data.roomId && data.roomId !== socket.roomId) return;
+
+        const room = getRoomData(socket.roomId);
+        if (room.sessionKey && room.sessionKey !== data.sessionKey) {
+            socket.emit('session-force-exit', { roomId: socket.roomId, sessionKey: room.sessionKey });
+            return;
+        }
+
+        applyRoomSession(socket.roomId, data.sessionKey);
+        if (room.sessionClosed) {
+            socket.emit('session-force-exit', { roomId: socket.roomId, sessionKey: room.sessionKey });
+        } else if (room.sessionEnding) {
+            socket.emit('session-ending', {
+                roomId: socket.roomId,
+                sessionKey: room.sessionKey,
+                endsAt: room.sessionEndAt,
+                message: 'Phiên an tọa đã đến giờ kết thúc. Cảm ơn bạn đã cùng Du Sen giữ gìn khoảng lặng. Không gian sẽ khép lại sau 1 phút.'
+            });
+        }
     });
 
     // 7. ĐĂNG KÝ NHẬN VỊ TRÍ — MỖI TÀI KHOẢN CHỈ GIỮ MỘT GHẾ TRONG MỖI PHÒNG
@@ -378,6 +651,10 @@ io.on('connection', (socket) => {
         }
 
         const targetRoomId = (typeof data === 'object' && data && data.roomId) ? data.roomId : socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) {
+            socket.emit('claim-denied', { code: 'session-ended', message: 'Phiên đã kết thúc. Vui lòng chờ phiên tiếp theo.' });
+            return;
+        }
         syncSocketRoom(targetRoomId);
         const rawSeatId = typeof data === 'object' && data ? data.seatId : data;
 
@@ -405,8 +682,20 @@ io.on('connection', (socket) => {
         if (currentUserSeat && currentUserSeat.occupiedBy.socketId !== socket.id) {
             const previousSocket = io.sockets.sockets.get(currentUserSeat.occupiedBy.socketId);
             if (previousSocket && previousSocket.connected) {
-                showDuplicateSession(socket, 'Bạn đang tham gia không gian trên một thiết bị khác. Vui lòng tiếp tục sử dụng thiết bị đang giữ chỗ ngồi hiện tại.');
-                socket.emit('claim-denied', { code: 'duplicate-session', message: 'Bạn đang tham gia không gian trên một thiết bị khác. Vui lòng tiếp tục sử dụng thiết bị đang giữ chỗ ngồi hiện tại.' });
+                if (currentUserSeat.occupiedBy.deviceId && currentUserSeat.occupiedBy.deviceId === socket.deviceId) {
+                    previousSocket.identityBlocked = true;
+                    previousSocket.mySeatId = null;
+                    previousSocket.emit('same-device-session-replaced', {});
+                    currentUserSeat.occupiedBy.socketId = socket.id;
+                    currentUserSeat.occupiedBy.disconnectedAt = 0;
+                    socket.mySeatId = currentUserSeat.id;
+                    emitSeatState(socket.roomId);
+                    socket.emit('seat-reclaimed', { seatId: currentUserSeat.id });
+                    return;
+                }
+                const message = 'Bạn đang tham gia không gian trên một thiết bị khác. Vui lòng tiếp tục sử dụng thiết bị đang giữ chỗ ngồi hiện tại.';
+                showDuplicateSession(socket, message);
+                socket.emit('claim-denied', { code: 'duplicate-session', message });
                 return;
             }
 
@@ -477,6 +766,7 @@ io.on('connection', (socket) => {
     socket.on('leave-room', (data, acknowledge) => {
         const targetRoomId = (data && data.roomId) || socket.roomId;
         releaseSocketSeat(targetRoomId, socket.id);
+        releaseRoomEntry(targetRoomId, socket.id);
         socket.mySeatId = null;
         if (typeof acknowledge === 'function') acknowledge({ ok: true });
     });
@@ -485,10 +775,13 @@ io.on('connection', (socket) => {
     // không thể ghi đè danh sách phát đang được cả phòng sử dụng.
     socket.on('sync-playlist', (data) => {
         if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
 
         const currentRoom = getRoomData(socket.roomId);
+        if (currentRoom.sessionClosed) return;
         if (!data || !Array.isArray(data.playlist) || data.playlist.length === 0) return;
         if (currentRoom.activePlaylist.length > 0) return;
 
@@ -527,10 +820,13 @@ io.on('connection', (socket) => {
     // trackStartTime đổi nên các sự kiện đến trễ đều bị loại bỏ.
     socket.on('track-ended', (data) => {
         if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
 
         const currentRoom = getRoomData(socket.roomId);
+        if (currentRoom.sessionClosed) return;
         if (!data || typeof data !== 'object' || currentRoom.activePlaylist.length === 0) return;
 
         const endedIndex = Number(data.trackIndex);
@@ -554,10 +850,12 @@ io.on('connection', (socket) => {
 
     socket.on('send-heart', (data) => {
         if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
-        if (data && data.sessionKey) applyRoomSession(socket.roomId, data.sessionKey);
         const currentRoom = getRoomData(socket.roomId);
+        if (currentRoom.sessionClosed) return;
         currentRoom.totalHearts++;
         const senderName = (data && (data.userName || data.name)) || socket.userName || 'Lữ khách';
         io.to(socket.roomId).emit('heart-broadcast', {
@@ -570,10 +868,12 @@ io.on('connection', (socket) => {
 
     socket.on('send-lantern', (data) => {
         if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
-        if (data && data.sessionKey) applyRoomSession(socket.roomId, data.sessionKey);
         const currentRoom = getRoomData(socket.roomId);
+        if (currentRoom.sessionClosed) return;
         const word = (data && data.word) || 'An yên';
         if (currentRoom.lanternCounts[word] === undefined) currentRoom.lanternCounts[word] = 0;
         currentRoom.lanternCounts[word]++;
@@ -589,8 +889,12 @@ io.on('connection', (socket) => {
 
     socket.on('dzp_send_wish', (data) => {
         if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
         if (data && data.roomId) syncSocketRoom(data.roomId);
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
+        const currentRoom = getRoomData(socket.roomId);
+        if (currentRoom.sessionClosed) return;
         const wishText = (data && data.text) ? String(data.text).trim() : '';
         if (!wishText) return;
         io.to(socket.roomId).emit('dzp_receive_wish', {
@@ -602,6 +906,7 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         const roomId = socket.roomId || currentRoomId;
+        markRoomEntryDisconnected(socket);
         const currentRoom = getRoomData(roomId);
         currentRoom.seats.forEach(seat => {
             if (seat.occupiedBy && seat.occupiedBy.socketId === socket.id) {
