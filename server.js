@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.4 - Session Lifecycle, Room-Scoped Entry Lock & Authoritative Audio Sync
+ * v10.4.5 - Admin Audio Control, Special Audio Override & Fade Sync
  * GitHub Repo Server code for Render deployment
  */
 
@@ -11,7 +11,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = Buffer.from(buf); } }));
 app.use(cors());
 
 const server = http.createServer(app);
@@ -62,7 +62,18 @@ function getRoomData(roomId) {
             currentTrackIndex: 0,
             trackStartTime: Date.now(),
             activePlaylist: [],
-            playlistFingerprint: ''
+            playlistFingerprint: '',
+            audioMode: 'playlist',
+            audioResumeMode: 'playlist',
+            audioPaused: false,
+            audioPausedPosition: 0,
+            specialAudioId: '',
+            specialAudioStartTime: 0,
+            specialAudioUrl: '',
+            specialAudioTitle: '',
+            specialInterruptedTrackIndex: 0,
+            specialAudioDuration: 0,
+            specialAudioEndTimer: null
         };
     }
     return rooms[rId];
@@ -138,6 +149,90 @@ function emitSeatState(roomId) {
     io.to(roomId).emit('seat-state-changed', getPublicSeats(room));
 }
 
+function completeSpecialAudio(roomId, expectedAudioId, expectedStartTime) {
+    const room = getRoomData(roomId);
+    if (room.audioMode !== 'special' || room.audioPaused ||
+        room.specialAudioId !== expectedAudioId || Number(room.specialAudioStartTime) !== Number(expectedStartTime)) return false;
+    if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+    room.specialAudioEndTimer = null;
+    if (!room.activePlaylist.length) {
+        room.audioMode = 'paused';
+        room.audioResumeMode = 'playlist';
+        room.audioPaused = true;
+        room.specialAudioId = '';
+        room.specialAudioUrl = '';
+        room.specialAudioTitle = '';
+        room.specialAudioStartTime = 0;
+        room.specialAudioDuration = 0;
+        io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 0, audioState: getRoomAudioState(room) });
+        return false;
+    }
+    room.currentTrackIndex = (Number(room.specialInterruptedTrackIndex || 0) + 1) % room.activePlaylist.length;
+    room.trackStartTime = Date.now();
+    room.audioMode = 'playlist';
+    room.audioResumeMode = 'playlist';
+    room.audioPaused = false;
+    room.audioPausedPosition = 0;
+    room.specialAudioId = '';
+    room.specialAudioUrl = '';
+    room.specialAudioTitle = '';
+    room.specialAudioStartTime = 0;
+    room.specialAudioDuration = 0;
+    io.to(roomId).emit('sync-audio-track', { ...getRoomAudioState(room), fadeInMs: 2200 });
+    console.log(`[Zen Pond] Special audio completed; playlist resumed: ${roomId}`);
+    return true;
+}
+
+function scheduleSpecialAudioEnd(roomId) {
+    const room = getRoomData(roomId);
+    if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+    room.specialAudioEndTimer = null;
+    if (room.audioMode !== 'special' || room.audioPaused || !(room.specialAudioDuration > 0)) return;
+    const expectedId = room.specialAudioId;
+    const expectedStart = room.specialAudioStartTime;
+    const endAt = expectedStart + room.specialAudioDuration * 1000;
+    const delay = Math.max(0, endAt - Date.now());
+    room.specialAudioEndTimer = setTimeout(() => {
+        completeSpecialAudio(roomId, expectedId, expectedStart);
+    }, delay);
+}
+
+function getRoomAudioState(room) {
+    const mode = room.audioMode || 'playlist';
+    let url = '';
+    let title = '';
+    let trackStartTime = room.trackStartTime;
+    if (mode === 'special') {
+        url = room.specialAudioUrl || '';
+        title = room.specialAudioTitle || 'Audio đặc biệt';
+        trackStartTime = room.specialAudioStartTime || Date.now();
+    } else {
+        const track = room.activePlaylist[room.currentTrackIndex];
+        url = track?.url || '';
+        title = track?.title || '';
+        if (mode === 'paused') {
+            const resumeMode = room.audioResumeMode || 'playlist';
+            if (resumeMode === 'special') {
+                url = room.specialAudioUrl || '';
+                title = room.specialAudioTitle || 'Audio đặc biệt';
+                trackStartTime = Date.now() - (Number(room.audioPausedPosition) || 0) * 1000;
+            } else {
+                trackStartTime = Date.now() - (Number(room.audioPausedPosition) || 0) * 1000;
+            }
+        }
+    }
+    return {
+        mode,
+        paused: mode === 'paused',
+        trackIndex: room.currentTrackIndex,
+        trackStartTime,
+        url,
+        title,
+        specialAudioId: room.specialAudioId || '',
+        fadeInMs: 0
+    };
+}
+
 // Gửi snapshot trạng thái phòng cho client mới kết nối.
 // Cả client bị chặn do đăng nhập trên thiết bị khác vẫn cần snapshot
 // để hiển thị những người đang an tọa; việc này KHÔNG cấp quyền giữ ghế.
@@ -157,12 +252,7 @@ function sendRoomInitialState(socket, roomId) {
         seats,
         totalHearts: room.totalHearts,
         lanternCounts: room.lanternCounts,
-        audioState: {
-            trackIndex: room.currentTrackIndex,
-            trackStartTime: room.trackStartTime,
-            url: room.activePlaylist[room.currentTrackIndex]?.url || '',
-            title: room.activePlaylist[room.currentTrackIndex]?.title || ''
-        }
+        audioState: getRoomAudioState(room)
     });
 }
 
@@ -399,6 +489,8 @@ function forceEndRoomSession(roomId, expectedSessionKey) {
 
     room.sessionClosed = true;
     clearRoomSessionTimers(room);
+    if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+    room.specialAudioEndTimer = null;
 
     room.seats.forEach(seat => {
         clearSeatReleaseTimer(rId, seat.id);
@@ -475,6 +567,18 @@ function applyRoomSession(roomId, sessionKey) {
     room.sessionEndAt = endAt;
     room.sessionEnding = false;
     room.sessionClosed = false;
+    if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+    room.specialAudioEndTimer = null;
+    room.audioMode = 'playlist';
+    room.audioResumeMode = 'playlist';
+    room.audioPaused = false;
+    room.audioPausedPosition = 0;
+    room.specialAudioId = '';
+    room.specialAudioUrl = '';
+    room.specialAudioTitle = '';
+    room.specialAudioStartTime = 0;
+    room.specialAudioDuration = 0;
+    room.trackStartTime = Date.now();
     room.totalHearts = 0;
     Object.keys(room.lanternCounts).forEach(word => { room.lanternCounts[word] = 0; });
     io.to(rId).emit('session-counters-reset', {
@@ -486,6 +590,105 @@ function applyRoomSession(roomId, sessionKey) {
     console.log(`[Zen Pond] New session: ${rId} | ${normalizedKey} | Counters reset | Ends ${new Date(endAt).toISOString()}`);
     return true;
 }
+
+// Admin control endpoint: chỉ nhận lệnh ký HMAC từ WordPress đã xác thực.
+app.post('/admin/audio-control', (req, res) => {
+    const timestamp = String(req.get('X-DZP-Timestamp') || '');
+    const signature = String(req.get('X-DZP-Signature') || '');
+    const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from('');
+    const requestTime = Number(timestamp);
+    if (!IDENTITY_SECRET || !Number.isFinite(requestTime) || Math.abs(Math.floor(Date.now() / 1000) - requestTime) > 90 || !/^[a-f0-9]{64}$/i.test(signature)) {
+        return res.status(401).json({ ok: false, message: 'Unauthorized request.' });
+    }
+    const expected = crypto.createHmac('sha256', IDENTITY_SECRET).update(timestamp + '.' + rawBody.toString('utf8')).digest('hex');
+    const receivedBuffer = Buffer.from(signature, 'hex');
+    const expectedBuffer = Buffer.from(expected, 'hex');
+    if (receivedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) {
+        return res.status(401).json({ ok: false, message: 'Invalid signature.' });
+    }
+
+    const data = req.body && typeof req.body === 'object' ? req.body : {};
+    const roomId = String(data.roomId || '');
+    const action = String(data.action || '');
+    if (!['main', 'room_2'].includes(roomId) || !['pause', 'resume', 'special'].includes(action)) {
+        return res.status(400).json({ ok: false, message: 'Invalid room or action.' });
+    }
+
+    const room = getRoomData(roomId);
+    if (Array.isArray(data.playlist)) {
+        const normalized = data.playlist.map(item => ({
+            title: String(item?.title || '').slice(0, 180),
+            url: String(item?.url || '').trim()
+        })).filter(item => /^https?:\/\//i.test(item.url));
+        if (normalized.length) {
+            const hadPlaylist = room.activePlaylist.length > 0;
+            room.activePlaylist = normalized;
+            room.playlistFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+            room.currentTrackIndex = Math.min(room.currentTrackIndex, normalized.length - 1);
+            if (!hadPlaylist) room.trackStartTime = Date.now();
+        }
+    }
+
+    if (action === 'pause') {
+        if (room.audioMode !== 'paused') {
+            const state = getRoomAudioState(room);
+            room.audioResumeMode = room.audioMode || 'playlist';
+            room.audioPausedPosition = Math.max(0, (Date.now() - Number(state.trackStartTime || Date.now())) / 1000);
+            room.audioMode = 'paused';
+            room.audioPaused = true;
+            if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+            room.specialAudioEndTimer = null;
+        }
+        io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 1600, audioState: getRoomAudioState(room) });
+        console.log(`[Zen Pond] Admin paused room audio: ${roomId}`);
+        return res.json({ ok: true, roomId, action });
+    }
+
+    if (action === 'resume') {
+        if (room.audioMode === 'paused') {
+            const resumeMode = room.audioResumeMode || 'playlist';
+            const startTime = Date.now() - Math.max(0, Number(room.audioPausedPosition) || 0) * 1000;
+            room.audioMode = resumeMode;
+            room.audioPaused = false;
+            if (resumeMode === 'special') {
+                room.specialAudioStartTime = startTime;
+                scheduleSpecialAudioEnd(roomId);
+            } else room.trackStartTime = startTime;
+        }
+        io.to(roomId).emit('audio-resume', { roomId, audioState: getRoomAudioState(room), fadeInMs: 1800 });
+        console.log(`[Zen Pond] Admin resumed room audio: ${roomId}`);
+        return res.json({ ok: true, roomId, action });
+    }
+
+    const special = data.specialAudio && typeof data.specialAudio === 'object' ? data.specialAudio : {};
+    const specialUrl = String(special.url || '').trim();
+    if (!/^https?:\/\//i.test(specialUrl) || specialUrl.length > 2048) {
+        return res.status(400).json({ ok: false, message: 'Invalid special audio URL.' });
+    }
+    room.specialInterruptedTrackIndex = room.currentTrackIndex;
+    if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+    room.specialAudioEndTimer = null;
+    room.specialAudioDuration = 0;
+    room.specialAudioId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+    room.specialAudioUrl = specialUrl;
+    room.specialAudioTitle = String(special.title || 'Audio đặc biệt').slice(0, 180);
+    room.specialAudioStartTime = Date.now() + 1600;
+    room.audioMode = 'special';
+    room.audioResumeMode = 'playlist';
+    room.audioPaused = false;
+    room.audioPausedPosition = 0;
+    io.to(roomId).emit('audio-special-start', {
+        roomId,
+        specialAudioId: room.specialAudioId,
+        url: room.specialAudioUrl,
+        title: room.specialAudioTitle,
+        trackStartTime: room.specialAudioStartTime,
+        fadeOutMs: 1400,
+        fadeInMs: 1600
+    });
+    console.log(`[Zen Pond] Admin started special audio: ${roomId} | ${room.specialAudioId}`);
+    return res.json({ ok: true, roomId, action, specialAudioId: room.specialAudioId });
+});
 
 // 4. SOCKET CONNECTION
 io.on('connection', (socket) => {
@@ -797,21 +1000,21 @@ io.on('connection', (socket) => {
 
         if (!normalizedPlaylist.length) return;
         currentRoom.activePlaylist = normalizedPlaylist;
+        currentRoom.playlistFingerprint = crypto.createHash('sha256')
+            .update(JSON.stringify(normalizedPlaylist)).digest('hex');
+
+        // Không để client vừa vào ghi đè trạng thái pause/special do Admin đang điều khiển.
+        const preservingAdminOverride = currentRoom.audioMode === 'special' ||
+            (currentRoom.audioMode === 'paused' && currentRoom.audioResumeMode === 'special');
+        if (preservingAdminOverride) return;
+
         currentRoom.currentTrackIndex = 0;
         // Bắt đầu mốc thời gian tại lúc playlist chuẩn được khởi tạo,
         // tránh tính nhầm thời gian từ lúc room object được tạo trước đó.
         currentRoom.trackStartTime = Date.now();
-        currentRoom.playlistFingerprint = crypto.createHash('sha256')
-            .update(JSON.stringify(normalizedPlaylist)).digest('hex');
 
         // Phát trạng thái chuẩn ngay khi playlist đầu tiên được đăng ký.
-        const firstTrack = currentRoom.activePlaylist[currentRoom.currentTrackIndex];
-        io.to(socket.roomId).emit('sync-audio-track', {
-            trackIndex: currentRoom.currentTrackIndex,
-            trackStartTime: currentRoom.trackStartTime,
-            url: firstTrack.url,
-            title: firstTrack.title
-        });
+        io.to(socket.roomId).emit('sync-audio-track', getRoomAudioState(currentRoom));
         console.log(`[Zen Pond] Audio playlist initialized: room '${socket.roomId}' (${normalizedPlaylist.length} tracks)`);
     });
 
@@ -826,7 +1029,7 @@ io.on('connection', (socket) => {
         if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
 
         const currentRoom = getRoomData(socket.roomId);
-        if (currentRoom.sessionClosed) return;
+        if (currentRoom.sessionClosed || currentRoom.audioMode !== 'playlist') return;
         if (!data || typeof data !== 'object' || currentRoom.activePlaylist.length === 0) return;
 
         const endedIndex = Number(data.trackIndex);
@@ -840,12 +1043,35 @@ io.on('connection', (socket) => {
 
         currentRoom.currentTrackIndex = nextIndex;
         currentRoom.trackStartTime = Date.now();
-        io.to(socket.roomId).emit('sync-audio-track', {
-            trackIndex: currentRoom.currentTrackIndex,
-            trackStartTime: currentRoom.trackStartTime,
-            url: nextTrack.url,
-            title: nextTrack.title
-        });
+        io.to(socket.roomId).emit('sync-audio-track', { ...getRoomAudioState(currentRoom), fadeInMs: 0 });
+    });
+
+    socket.on('special-audio-metadata', (data) => {
+        if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
+        if (data && data.roomId) syncSocketRoom(data.roomId);
+        if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
+        const room = getRoomData(socket.roomId);
+        const duration = Number(data && data.duration);
+        if (room.audioMode !== 'special' || room.audioPaused || !data ||
+            String(data.specialAudioId || '') !== String(room.specialAudioId || '') ||
+            Number(data.trackStartTime) !== Number(room.specialAudioStartTime) ||
+            !Number.isFinite(duration) || duration <= 0 || duration > 6 * 60 * 60) return;
+        room.specialAudioDuration = duration;
+        scheduleSpecialAudioEnd(socket.roomId);
+    });
+
+    socket.on('special-audio-ended', (data) => {
+        if (socket.identityBlocked) return;
+        const targetRoomId = (data && data.roomId) || socket.roomId;
+        if (getRoomData(targetRoomId).sessionClosed) return;
+        if (data && data.roomId) syncSocketRoom(data.roomId);
+        if (blockIfUserIsSeatedElsewhere(socket, socket.roomId)) return;
+        const room = getRoomData(socket.roomId);
+        if (!data || String(data.specialAudioId || '') !== String(room.specialAudioId || '') ||
+            Number(data.trackStartTime) !== Number(room.specialAudioStartTime)) return;
+        completeSpecialAudio(socket.roomId, room.specialAudioId, room.specialAudioStartTime);
     });
 
     socket.on('send-heart', (data) => {
@@ -935,20 +1161,15 @@ io.on('connection', (socket) => {
 setInterval(() => {
     Object.keys(rooms).forEach(roomId => {
         const room = rooms[roomId];
-        if (room.activePlaylist && room.activePlaylist.length > 0) {
-            io.to(roomId).emit('audio-sync-heartbeat', {
-                trackIndex: room.currentTrackIndex,
-                trackStartTime: room.trackStartTime,
-                url: room.activePlaylist[room.currentTrackIndex]?.url || '',
-                title: room.activePlaylist[room.currentTrackIndex]?.title || ''
-            });
+        if (room.audioMode === 'special' || room.audioMode === 'paused' || (room.activePlaylist && room.activePlaylist.length > 0)) {
+            io.to(roomId).emit('audio-sync-heartbeat', getRoomAudioState(room));
         }
     });
 }, 5000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.4.1 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.4.5 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
