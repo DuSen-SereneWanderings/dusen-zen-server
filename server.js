@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.6 - Playlist Entry Playback & Special Audio Stop/Resume Fix
+ * v10.4.7 - Audio Auto Start & AJAX Playlist Update
  * GitHub Repo Server code for Render deployment
  */
 
@@ -610,7 +610,7 @@ app.post('/admin/audio-control', (req, res) => {
     const data = req.body && typeof req.body === 'object' ? req.body : {};
     const roomId = String(data.roomId || '');
     const action = String(data.action || '');
-    if (!['main', 'room_2'].includes(roomId) || !['pause', 'resume', 'special'].includes(action)) {
+    if (!['main', 'room_2'].includes(roomId) || !['pause', 'resume', 'special', 'update-playlist'].includes(action)) {
         return res.status(400).json({ ok: false, message: 'Invalid room or action.' });
     }
 
@@ -627,6 +627,30 @@ app.post('/admin/audio-control', (req, res) => {
             room.currentTrackIndex = Math.min(room.currentTrackIndex, normalized.length - 1);
             if (!hadPlaylist) room.trackStartTime = Date.now();
         }
+    }
+
+    if (action === 'update-playlist') {
+        const normalized = Array.isArray(data.playlist) ? data.playlist.map(item => ({
+            title: String(item?.title || '').slice(0, 180),
+            url: String(item?.url || '').trim()
+        })).filter(item => /^https?:\/\//i.test(item.url)) : [];
+        if (!normalized.length) return res.status(400).json({ ok: false, message: 'Playlist is empty.' });
+        room.activePlaylist = normalized;
+        room.playlistFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+        room.currentTrackIndex = 0;
+        if (room.audioMode === 'special') {
+            room.specialInterruptedTrackIndex = 0;
+        } else if (room.audioMode === 'paused') {
+            room.audioResumeMode = 'playlist';
+            room.audioPausedPosition = 0;
+        } else {
+            room.audioMode = 'playlist';
+            room.audioPaused = false;
+            room.trackStartTime = Date.now();
+            io.to(roomId).emit('sync-audio-track', { ...getRoomAudioState(room), fadeInMs: 1800 });
+        }
+        console.log(`[Zen Pond] Admin updated playlist: ${roomId} (${normalized.length} tracks)`);
+        return res.json({ ok: true, roomId, action });
     }
 
     if (action === 'pause') {
@@ -1002,7 +1026,15 @@ io.on('connection', (socket) => {
         const currentRoom = getRoomData(socket.roomId);
         if (currentRoom.sessionClosed) return;
         if (!data || !Array.isArray(data.playlist) || data.playlist.length === 0) return;
-        if (currentRoom.activePlaylist.length > 0) return;
+
+        // Playlist đã được khởi tạo bởi người vào trước: không ghi đè danh sách
+        // đang chạy, nhưng phải gửi snapshot hiện tại riêng cho người vừa vào.
+        // Nếu chỉ return ở đây, client mới sẽ không nhận lại lệnh phát vì init-state
+        // được gửi trước thao tác vào phòng và bị frontend bỏ qua khi popup còn mở.
+        if (currentRoom.activePlaylist.length > 0) {
+            socket.emit('sync-audio-track', getRoomAudioState(currentRoom));
+            return;
+        }
 
         const normalizedPlaylist = data.playlist.map((item) => {
             if (!item || typeof item !== 'object') return null;
