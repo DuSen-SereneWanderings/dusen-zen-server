@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.8 - Audio Auto Start & AJAX Playlist Update
+ * v10.4.9 - Read-only Seat Availability Snapshot
  * GitHub Repo Server code for Render deployment
  */
 
@@ -236,6 +236,20 @@ function getRoomAudioState(room) {
 // Gửi snapshot trạng thái phòng cho client mới kết nối.
 // Cả client bị chặn do đăng nhập trên thiết bị khác vẫn cần snapshot
 // để hiển thị những người đang an tọa; việc này KHÔNG cấp quyền giữ ghế.
+// Snapshot CHỈ ĐỌC số vị trí còn trống cho popup cổng vào.
+// Không gửi init-state, không cấp ghế và không thay đổi trạng thái tham gia.
+function sendSeatAvailabilitySnapshot(socket, roomId) {
+    const room = getRoomData(roomId);
+    const occupiedCount = room.seats.filter(seat => seat.occupiedBy !== null).length;
+    const availableSeats = Math.max(0, room.maxSeats - occupiedCount);
+
+    socket.emit('seat-availability-snapshot', {
+        isFull: availableSeats <= 0,
+        availableSeats,
+        maxSeats: room.maxSeats
+    });
+}
+
 function sendRoomInitialState(socket, roomId) {
     const room = getRoomData(roomId);
     const seats = getPublicSeats(room);
@@ -762,6 +776,9 @@ io.on('connection', (socket) => {
     socket.roomId = currentRoomId;
     socket.join(currentRoomId);
 
+    // Chỉ trả số vị trí X/Y khi kết nối; không gọi request-entry và không claim ghế.
+    sendSeatAvailabilitySnapshot(socket, currentRoomId);
+
     const handshakeAuth = socket.handshake.auth || {};
     const identity = verifyIdentityToken(handshakeAuth.identityToken);
     socket.userId = identity ? identity.userId : null;
@@ -1243,7 +1260,7 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.4.5 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.4.9 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
