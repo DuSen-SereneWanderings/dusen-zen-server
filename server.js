@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.5 - Admin Audio Control, Special Audio Override & Fade Sync
+ * v10.4.6 - Playlist Entry Playback & Special Audio Stop/Resume Fix
  * GitHub Repo Server code for Render deployment
  */
 
@@ -631,13 +631,29 @@ app.post('/admin/audio-control', (req, res) => {
 
     if (action === 'pause') {
         if (room.audioMode !== 'paused') {
-            const state = getRoomAudioState(room);
-            room.audioResumeMode = room.audioMode || 'playlist';
-            room.audioPausedPosition = Math.max(0, (Date.now() - Number(state.trackStartTime || Date.now())) / 1000);
+            // Khi Admin dừng audio đặc biệt, hủy hẳn phần audio override.
+            // Lần tiếp tục sau đó phải quay về playlist, không phát lại audio đặc biệt.
+            if (room.audioMode === 'special') {
+                if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+                room.specialAudioEndTimer = null;
+                if (room.activePlaylist.length) {
+                    room.currentTrackIndex = (Number(room.specialInterruptedTrackIndex || 0) + 1) % room.activePlaylist.length;
+                }
+                room.trackStartTime = Date.now();
+                room.audioResumeMode = 'playlist';
+                room.audioPausedPosition = 0;
+                room.specialAudioId = '';
+                room.specialAudioUrl = '';
+                room.specialAudioTitle = '';
+                room.specialAudioStartTime = 0;
+                room.specialAudioDuration = 0;
+            } else {
+                const state = getRoomAudioState(room);
+                room.audioResumeMode = 'playlist';
+                room.audioPausedPosition = Math.max(0, (Date.now() - Number(state.trackStartTime || Date.now())) / 1000);
+            }
             room.audioMode = 'paused';
             room.audioPaused = true;
-            if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
-            room.specialAudioEndTimer = null;
         }
         io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 1600, audioState: getRoomAudioState(room) });
         console.log(`[Zen Pond] Admin paused room audio: ${roomId}`);
