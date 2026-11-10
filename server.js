@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.1 - Verified Identity, Single Seat & Authoritative Audio Sync
+ * v10.4.2 - Verified Identity, Seat Snapshot & Authoritative Audio Sync
  * GitHub Repo Server code for Render deployment
  */
 
@@ -128,6 +128,34 @@ function clearSeatReleaseTimer(roomId, seatId) {
 function emitSeatState(roomId) {
     const room = getRoomData(roomId);
     io.to(roomId).emit('seat-state-changed', getPublicSeats(room));
+}
+
+// Gửi snapshot trạng thái phòng cho client mới kết nối.
+// Cả client bị chặn do đăng nhập trên thiết bị khác vẫn cần snapshot
+// để hiển thị những người đang an tọa; việc này KHÔNG cấp quyền giữ ghế.
+function sendRoomInitialState(socket, roomId) {
+    const room = getRoomData(roomId);
+    const seats = getPublicSeats(room);
+    const occupiedCount = room.seats.filter(seat => seat.occupiedBy !== null).length;
+
+    socket.emit('entry-status-checked', {
+        isFull: (room.maxSeats - occupiedCount) <= 0,
+        availableSeats: room.maxSeats - occupiedCount,
+        maxSeats: room.maxSeats,
+        seats
+    });
+
+    socket.emit('init-state', {
+        seats,
+        totalHearts: room.totalHearts,
+        lanternCounts: room.lanternCounts,
+        audioState: {
+            trackIndex: room.currentTrackIndex,
+            trackStartTime: room.trackStartTime,
+            url: room.activePlaylist[room.currentTrackIndex]?.url || '',
+            title: room.activePlaylist[room.currentTrackIndex]?.title || ''
+        }
+    });
 }
 
 function releaseSocketSeat(roomId, socketId) {
@@ -313,6 +341,10 @@ io.on('connection', (socket) => {
 
         const existing = resolveExistingUserSeat(socket, socket.roomId);
         if (!existing.allowed) {
+            // Vẫn gửi trạng thái ghế để client vẽ đầy đủ người đang có mặt.
+            // Client này không được claim-seat; snapshot chỉ phục vụ hiển thị.
+            sendRoomInitialState(socket, socket.roomId);
+
             const message = existing.reason === 'grace'
                 ? 'Tài khoản của bạn vừa mất kết nối trên một thiết bị khác. Vui lòng chờ tối đa 30 giây để hệ thống xác nhận phiên cũ đã kết thúc rồi thử lại.'
                 : 'Bạn đang tham gia không gian trên một thiết bị khác. Vui lòng tiếp tục sử dụng thiết bị đang giữ chỗ ngồi hiện tại.';
@@ -325,26 +357,7 @@ io.on('connection', (socket) => {
         if (wasIdentityBlocked) socket.emit('identity-session-available', {});
 
         applyRoomSession(socket.roomId, userObj.sessionKey);
-        const currentRoom = getRoomData(socket.roomId);
-        const occupiedCount = currentRoom.seats.filter(seat => seat.occupiedBy !== null).length;
-        const availableSeats = currentRoom.maxSeats - occupiedCount;
-        socket.emit('entry-status-checked', {
-            isFull: availableSeats <= 0,
-            availableSeats,
-            maxSeats: currentRoom.maxSeats,
-            seats: getPublicSeats(currentRoom)
-        });
-        socket.emit('init-state', {
-            seats: getPublicSeats(currentRoom),
-            totalHearts: currentRoom.totalHearts,
-            lanternCounts: currentRoom.lanternCounts,
-            audioState: {
-                trackIndex: currentRoom.currentTrackIndex,
-                trackStartTime: currentRoom.trackStartTime,
-                url: currentRoom.activePlaylist[currentRoom.currentTrackIndex]?.url || '',
-                title: currentRoom.activePlaylist[currentRoom.currentTrackIndex]?.title || ''
-            }
-        });
+        sendRoomInitialState(socket, socket.roomId);
         io.to(socket.roomId).emit('update-online-count', getRoomOnlineCount(socket.roomId));
     });
 
