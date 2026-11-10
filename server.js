@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.7 - Audio Auto Start & AJAX Playlist Update
+ * v10.4.8 - Audio Auto Start & AJAX Playlist Update
  * GitHub Repo Server code for Render deployment
  */
 
@@ -610,7 +610,7 @@ app.post('/admin/audio-control', (req, res) => {
     const data = req.body && typeof req.body === 'object' ? req.body : {};
     const roomId = String(data.roomId || '');
     const action = String(data.action || '');
-    if (!['main', 'room_2'].includes(roomId) || !['pause', 'resume', 'special', 'update-playlist'].includes(action)) {
+    if (!['main', 'room_2'].includes(roomId) || !['pause', 'resume', 'special', 'stop-special', 'update-playlist'].includes(action)) {
         return res.status(400).json({ ok: false, message: 'Invalid room or action.' });
     }
 
@@ -650,6 +650,32 @@ app.post('/admin/audio-control', (req, res) => {
             io.to(roomId).emit('sync-audio-track', { ...getRoomAudioState(room), fadeInMs: 1800 });
         }
         console.log(`[Zen Pond] Admin updated playlist: ${roomId} (${normalized.length} tracks)`);
+        return res.json({ ok: true, roomId, action });
+    }
+
+    if (action === 'stop-special') {
+        const specialIsActive = room.audioMode === 'special' ||
+            (room.audioMode === 'paused' && room.audioResumeMode === 'special');
+        if (!specialIsActive) {
+            return res.status(409).json({ ok: false, roomId, action, message: 'No special audio is currently playing.' });
+        }
+        if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
+        room.specialAudioEndTimer = null;
+        if (room.activePlaylist.length) {
+            room.currentTrackIndex = (Number(room.specialInterruptedTrackIndex || 0) + 1) % room.activePlaylist.length;
+        }
+        room.trackStartTime = Date.now();
+        room.audioResumeMode = 'playlist';
+        room.audioPausedPosition = 0;
+        room.audioMode = 'paused';
+        room.audioPaused = true;
+        room.specialAudioId = '';
+        room.specialAudioUrl = '';
+        room.specialAudioTitle = '';
+        room.specialAudioStartTime = 0;
+        room.specialAudioDuration = 0;
+        io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 1200, audioState: getRoomAudioState(room) });
+        console.log(`[Zen Pond] Admin stopped special audio: ${roomId}`);
         return res.json({ ok: true, roomId, action });
     }
 
