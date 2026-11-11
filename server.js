@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.9 - Read-only Seat Availability Snapshot
+ * v10.4.10 - Reconnect Seat Profile & Connection Diagnostics
  * GitHub Repo Server code for Render deployment
  */
 
@@ -9,6 +9,9 @@ const http = require('http');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
 const cors = require('cors');
+
+// Dùng để nhận biết tiến trình vừa khởi động lại (ví dụ dịch vụ vừa thức dậy).
+const SERVER_STARTED_AT = Date.now();
 
 const app = express();
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = Buffer.from(buf); } }));
@@ -772,9 +775,17 @@ app.post('/admin/audio-control', (req, res) => {
 
 // 4. SOCKET CONNECTION
 io.on('connection', (socket) => {
+    socket.connectedAt = Date.now();
+    socket.entryAcceptedAt = 0;
     let currentRoomId = socket.handshake.query.roomId || 'main';
     socket.roomId = currentRoomId;
     socket.join(currentRoomId);
+
+    // Chỉ ghi metadata thời gian/kết nối, không ghi email hay token người dùng.
+    console.log(`[Zen Pond] Socket connected | room=${currentRoomId} | transport=${socket.conn.transport.name} | serverUptimeMs=${Date.now() - SERVER_STARTED_AT} | socket=${socket.id.slice(0, 8)}`);
+    socket.conn.on('upgrade', (transport) => {
+        console.log(`[Zen Pond] Socket transport upgraded | room=${socket.roomId} | transport=${transport.name} | socket=${socket.id.slice(0, 8)}`);
+    });
 
     // Chỉ trả số vị trí X/Y khi kết nối; không gọi request-entry và không claim ghế.
     sendSeatAvailabilitySnapshot(socket, currentRoomId);
@@ -875,6 +886,8 @@ io.on('connection', (socket) => {
         socket.duplicateNoticeSent = false;
         if (wasIdentityBlocked) socket.emit('identity-session-available', {});
 
+        socket.entryAcceptedAt = Date.now();
+        console.log(`[Zen Pond] Room entry accepted | room=${socket.roomId} | sinceConnectMs=${socket.entryAcceptedAt - socket.connectedAt} | serverUptimeMs=${socket.entryAcceptedAt - SERVER_STARTED_AT} | socket=${socket.id.slice(0, 8)}`);
         sendRoomInitialState(socket, socket.roomId);
         reply({ ok: true });
         io.to(socket.roomId).emit('update-online-count', getRoomOnlineCount(socket.roomId));
@@ -1037,7 +1050,10 @@ io.on('connection', (socket) => {
             disconnectedAt: 0
         };
         socket.mySeatId = targetSeat.id;
-        console.log(`[Zen Pond] Seat claimed: Seat ${targetSeat.id} in room '${socket.roomId}' by '${socket.userName}' (${socket.id})`);
+        const claimAt = Date.now();
+        const sinceConnectMs = socket.connectedAt ? claimAt - socket.connectedAt : -1;
+        const sinceEntryMs = socket.entryAcceptedAt ? claimAt - socket.entryAcceptedAt : -1;
+        console.log(`[Zen Pond] Seat claimed | seat=${targetSeat.id} | room=${socket.roomId} | sinceConnectMs=${sinceConnectMs} | sinceEntryMs=${sinceEntryMs} | hasDisplayName=${Boolean(socket.userName && socket.userName !== 'Lữ khách')} | socket=${socket.id.slice(0, 8)}`);
         emitSeatState(socket.roomId);
 
         // Nếu cùng tài khoản đã mở phòng trên tab/thiết bị khác, báo ngay khi ghế đầu tiên được giữ.
@@ -1221,7 +1237,8 @@ io.on('connection', (socket) => {
         });
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+        console.log(`[Zen Pond] Socket disconnected | room=${socket.roomId || currentRoomId} | reason=${String(reason || 'unknown')} | socket=${socket.id.slice(0, 8)}`);
         const roomId = socket.roomId || currentRoomId;
         markRoomEntryDisconnected(socket);
         const currentRoom = getRoomData(roomId);
@@ -1260,7 +1277,7 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.4.9 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.4.10 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
