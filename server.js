@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.4.10 - Reconnect Seat Profile & Connection Diagnostics
+ * v10.5.0 - Verified Room Presence & Private Messaging Relay
  * GitHub Repo Server code for Render deployment
  */
 
@@ -529,6 +529,8 @@ function forceEndRoomSession(roomId, expectedSessionKey) {
         const memberSocket = io.sockets.sockets.get(socketId);
         if (memberSocket) {
             memberSocket.mySeatId = null;
+            memberSocket.roomEntryAccepted = false;
+            memberSocket.entryAcceptedAt = 0;
             memberSocket.leave(rId);
         }
     });
@@ -607,6 +609,97 @@ function applyRoomSession(roomId, sessionKey) {
     console.log(`[Zen Pond] New session: ${rId} | ${normalizedKey} | Counters reset | Ends ${new Date(endAt).toISOString()}`);
     return true;
 }
+
+// Xác thực các yêu cầu nội bộ ký HMAC từ WordPress.
+function verifyWordPressSignedRequest(req, res) {
+    const timestamp = String(req.get('X-DZP-Timestamp') || '');
+    const signature = String(req.get('X-DZP-Signature') || '');
+    const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from('');
+    const requestTime = Number(timestamp);
+    if (!IDENTITY_SECRET || !Number.isFinite(requestTime) || Math.abs(Math.floor(Date.now() / 1000) - requestTime) > 90 || !/^[a-f0-9]{64}$/i.test(signature)) {
+        res.status(401).json({ ok: false, message: 'Unauthorized request.' });
+        return null;
+    }
+    const expected = crypto.createHmac('sha256', IDENTITY_SECRET).update(timestamp + '.' + rawBody.toString('utf8')).digest('hex');
+    const receivedBuffer = Buffer.from(signature, 'hex');
+    const expectedBuffer = Buffer.from(expected, 'hex');
+    if (receivedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) {
+        res.status(401).json({ ok: false, message: 'Invalid signature.' });
+        return null;
+    }
+    return req.body && typeof req.body === 'object' ? req.body : {};
+}
+
+function getAcceptedRoomUser(roomId, userId) {
+    const wantedRoom = String(roomId || 'main');
+    const wantedUser = Number(userId);
+    for (const candidate of io.sockets.sockets.values()) {
+        const members = io.sockets.adapter.rooms.get(wantedRoom);
+        if (!candidate.connected || candidate.identityBlocked || !candidate.userId ||
+            Number(candidate.userId) !== wantedUser || candidate.roomId !== wantedRoom ||
+            candidate.roomEntryAccepted !== true || !candidate.entryAcceptedAt || !members || !members.has(candidate.id)) continue;
+        return candidate;
+    }
+    return null;
+}
+
+// Presence is authoritative only after a successful request-entry acknowledgement.
+app.post('/chat/room-users', (req, res) => {
+    const data = verifyWordPressSignedRequest(req, res);
+    if (!data) return;
+    const requesterId = Number(data.requesterId);
+    const roomId = String(data.roomId || '');
+    if (!Number.isSafeInteger(requesterId) || requesterId <= 0 || !['main', 'room_2'].includes(roomId)) {
+        return res.status(400).json({ ok: false, message: 'Invalid requester or room.' });
+    }
+    if (!getAcceptedRoomUser(roomId, requesterId)) {
+        return res.status(403).json({ ok: false, message: 'Requester is not an accepted participant in this room.' });
+    }
+    const users = new Map();
+    for (const candidate of io.sockets.sockets.values()) {
+        const members = io.sockets.adapter.rooms.get(roomId);
+        if (!candidate.connected || candidate.identityBlocked || !candidate.userId ||
+            Number(candidate.userId) === requesterId || candidate.roomId !== roomId ||
+            candidate.roomEntryAccepted !== true || !candidate.entryAcceptedAt || !members || !members.has(candidate.id)) continue;
+        if (!users.has(Number(candidate.userId))) users.set(Number(candidate.userId), {
+            userId: Number(candidate.userId),
+            name: String(candidate.userName || 'Lữ khách').slice(0, 80),
+            avatar: String(candidate.userAvatar || '').slice(0, 1024)
+        });
+    }
+    return res.json({ ok: true, users: Array.from(users.values()) });
+});
+
+app.post('/chat/presence-check', (req, res) => {
+    const data = verifyWordPressSignedRequest(req, res);
+    if (!data) return;
+    const requesterId = Number(data.requesterId);
+    const targetUserId = Number(data.targetUserId);
+    const roomId = String(data.roomId || '');
+    if (!Number.isSafeInteger(requesterId) || requesterId <= 0 || !Number.isSafeInteger(targetUserId) || targetUserId <= 0 || requesterId === targetUserId || !['main', 'room_2'].includes(roomId)) {
+        return res.status(400).json({ ok: false, message: 'Invalid presence query.' });
+    }
+    const requester = getAcceptedRoomUser(roomId, requesterId);
+    const target = getAcceptedRoomUser(roomId, targetUserId);
+    if (!requester || !target) return res.status(409).json({ ok: false, message: 'Both users must be accepted participants in the same room.' });
+    return res.json({ ok: true, roomId, requesterId, targetUserId, checkedAt: Date.now() });
+});
+
+app.post('/chat/notify', (req, res) => {
+    const data = verifyWordPressSignedRequest(req, res);
+    if (!data) return;
+    const ids = Array.isArray(data.recipientIds) ? data.recipientIds.map(Number).filter(id => Number.isSafeInteger(id) && id > 0).slice(0, 100) : [];
+    const conversationId = Number(data.conversationId);
+    if (!ids.length || !Number.isSafeInteger(conversationId) || conversationId <= 0) return res.status(400).json({ ok: false, message: 'Invalid notification payload.' });
+    const recipients = new Set(ids);
+    let delivered = 0;
+    for (const candidate of io.sockets.sockets.values()) {
+        if (!candidate.connected || !candidate.userId || !recipients.has(Number(candidate.userId))) continue;
+        candidate.emit('dzp-chat-notification', { conversationId, at: Date.now() });
+        delivered++;
+    }
+    return res.json({ ok: true, delivered });
+});
 
 // Admin control endpoint: chỉ nhận lệnh ký HMAC từ WordPress đã xác thực.
 app.post('/admin/audio-control', (req, res) => {
@@ -777,6 +870,7 @@ app.post('/admin/audio-control', (req, res) => {
 io.on('connection', (socket) => {
     socket.connectedAt = Date.now();
     socket.entryAcceptedAt = 0;
+    socket.roomEntryAccepted = false;
     let currentRoomId = socket.handshake.query.roomId || 'main';
     socket.roomId = currentRoomId;
     socket.join(currentRoomId);
@@ -804,6 +898,8 @@ io.on('connection', (socket) => {
             releaseRoomEntry(socket.roomId, socket.id);
             socket.leave(socket.roomId);
             socket.roomId = targetRoomId;
+            socket.roomEntryAccepted = false;
+            socket.entryAcceptedAt = 0;
             socket.identityBlocked = false;
             socket.duplicateNoticeSent = false;
             socket.mySeatId = null;
@@ -819,6 +915,8 @@ io.on('connection', (socket) => {
         const reply = (payload) => { if (typeof acknowledge === 'function') acknowledge(payload); };
         const userObj = typeof data === 'object' && data !== null ? data : {};
         const targetRoomId = userObj.roomId || socket.roomId || 'main';
+        socket.roomEntryAccepted = false;
+        socket.entryAcceptedAt = 0;
         syncSocketRoom(targetRoomId);
 
         // Có thể xác thực lại token từ payload khi socket reconnect bằng client cũ.
@@ -863,6 +961,8 @@ io.on('connection', (socket) => {
                 sessionKey: roomSession.sessionKey,
                 message
             });
+            socket.roomEntryAccepted = false;
+            socket.entryAcceptedAt = 0;
             socket.leave(socket.roomId);
             return;
         }
@@ -887,6 +987,7 @@ io.on('connection', (socket) => {
         if (wasIdentityBlocked) socket.emit('identity-session-available', {});
 
         socket.entryAcceptedAt = Date.now();
+        socket.roomEntryAccepted = true;
         console.log(`[Zen Pond] Room entry accepted | room=${socket.roomId} | sinceConnectMs=${socket.entryAcceptedAt - socket.connectedAt} | serverUptimeMs=${socket.entryAcceptedAt - SERVER_STARTED_AT} | socket=${socket.id.slice(0, 8)}`);
         sendRoomInitialState(socket, socket.roomId);
         reply({ ok: true });
@@ -1069,6 +1170,8 @@ io.on('connection', (socket) => {
         const targetRoomId = (data && data.roomId) || socket.roomId;
         releaseSocketSeat(targetRoomId, socket.id);
         releaseRoomEntry(targetRoomId, socket.id);
+        socket.roomEntryAccepted = false;
+        socket.entryAcceptedAt = 0;
         socket.mySeatId = null;
         if (typeof acknowledge === 'function') acknowledge({ ok: true });
     });
@@ -1240,6 +1343,8 @@ io.on('connection', (socket) => {
     socket.on('disconnect', (reason) => {
         console.log(`[Zen Pond] Socket disconnected | room=${socket.roomId || currentRoomId} | reason=${String(reason || 'unknown')} | socket=${socket.id.slice(0, 8)}`);
         const roomId = socket.roomId || currentRoomId;
+        socket.roomEntryAccepted = false;
+        socket.entryAcceptedAt = 0;
         markRoomEntryDisconnected(socket);
         const currentRoom = getRoomData(roomId);
         currentRoom.seats.forEach(seat => {
@@ -1277,7 +1382,7 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.4.10 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.5.0 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
