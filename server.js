@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.5.0 - Verified Room Presence & Private Messaging Relay
+ * v10.5.1 - Admin Room Presence Lookup & Private Messaging Relay
  * GitHub Repo Server code for Render deployment
  */
 
@@ -652,7 +652,11 @@ app.post('/chat/room-users', (req, res) => {
     if (!Number.isSafeInteger(requesterId) || requesterId <= 0 || !['main', 'room_2'].includes(roomId)) {
         return res.status(400).json({ ok: false, message: 'Invalid requester or room.' });
     }
-    if (!getAcceptedRoomUser(roomId, requesterId)) {
+    // A trusted WordPress-signed administrator lookup may inspect room presence
+    // from the backend without joining the room. Ordinary frontend requests must
+    // still originate from an accepted participant in that room.
+    const requesterIsAdmin = data.requesterIsAdmin === true;
+    if (!requesterIsAdmin && !getAcceptedRoomUser(roomId, requesterId)) {
         return res.status(403).json({ ok: false, message: 'Requester is not an accepted participant in this room.' });
     }
     const users = new Map();
@@ -1382,7 +1386,7 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.5.0 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.5.1 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
