@@ -1,6 +1,6 @@
 /**
  * Du Sen Zen Pond - Realtime Socket.io Server
- * v10.5.1 - Admin Room Presence Lookup & Private Messaging Relay
+ * v10.5.2 - Authoritative per-room shuffle loop
  * GitHub Repo Server code for Render deployment
  */
 
@@ -65,6 +65,9 @@ function getRoomData(roomId) {
             currentTrackIndex: 0,
             trackStartTime: Date.now(),
             activePlaylist: [],
+            shuffleBag: [],
+            trackDurations: new Map(),
+            playlistEndTimer: null,
             playlistFingerprint: '',
             audioMode: 'playlist',
             audioResumeMode: 'playlist',
@@ -152,6 +155,51 @@ function emitSeatState(roomId) {
     io.to(roomId).emit('seat-state-changed', getPublicSeats(room));
 }
 
+// Each room owns its shuffle bag; no visitor chooses the next item.
+function shuffleIndices(length) {
+    const bag = Array.from({length}, (_, i) => i);
+    for (let i = bag.length - 1; i > 0; i--) {
+        const j = crypto.randomInt(i + 1);
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+    return bag;
+}
+function resetShuffle(room) {
+    room.shuffleBag = shuffleIndices(room.activePlaylist.length);
+    room.currentTrackIndex = room.shuffleBag.shift() ?? 0;
+}
+function nextShuffle(room) {
+    const length = room.activePlaylist.length;
+    if (length <= 1) return 0;
+    if (!room.shuffleBag.length) {
+        room.shuffleBag = shuffleIndices(length);
+        if (room.shuffleBag[0] === room.currentTrackIndex) {
+            const j = crypto.randomInt(1, length);
+            [room.shuffleBag[0], room.shuffleBag[j]] = [room.shuffleBag[j], room.shuffleBag[0]];
+        }
+    }
+    return room.shuffleBag.shift();
+}
+function schedulePlaylistEnd(roomId) {
+    const room=getRoomData(roomId);
+    if(room.playlistEndTimer) clearTimeout(room.playlistEndTimer);
+    room.playlistEndTimer=null;
+    if(room.sessionClosed||room.audioMode!=='playlist'||room.audioPaused)return;
+    const track=room.activePlaylist[room.currentTrackIndex],duration=track&&room.trackDurations.get(track.url);
+    if(!duration)return;
+    const index=room.currentTrackIndex,start=room.trackStartTime;
+    room.playlistEndTimer=setTimeout(()=>advancePlaylist(roomId,index,start),Math.max(0,start+duration*1000-Date.now()));
+}
+function advancePlaylist(roomId,index,start) {
+    const room=getRoomData(roomId);
+    if(room.sessionClosed||room.audioMode!=='playlist'||room.audioPaused||room.currentTrackIndex!==index||Number(room.trackStartTime)!==Number(start)||!room.activePlaylist.length)return false;
+    if(room.playlistEndTimer)clearTimeout(room.playlistEndTimer);
+    room.playlistEndTimer=null;
+    room.currentTrackIndex=nextShuffle(room);room.trackStartTime=Math.max(Date.now(),Number(start)+1);
+    io.to(roomId).emit('sync-audio-track',{...getRoomAudioState(room),fadeInMs:0});
+    schedulePlaylistEnd(roomId);return true;
+}
+
 function completeSpecialAudio(roomId, expectedAudioId, expectedStartTime) {
     const room = getRoomData(roomId);
     if (room.audioMode !== 'special' || room.audioPaused ||
@@ -170,7 +218,7 @@ function completeSpecialAudio(roomId, expectedAudioId, expectedStartTime) {
         io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 0, audioState: getRoomAudioState(room) });
         return false;
     }
-    room.currentTrackIndex = (Number(room.specialInterruptedTrackIndex || 0) + 1) % room.activePlaylist.length;
+    room.currentTrackIndex = nextShuffle(room);
     room.trackStartTime = Date.now();
     room.audioMode = 'playlist';
     room.audioResumeMode = 'playlist';
@@ -182,6 +230,7 @@ function completeSpecialAudio(roomId, expectedAudioId, expectedStartTime) {
     room.specialAudioStartTime = 0;
     room.specialAudioDuration = 0;
     io.to(roomId).emit('sync-audio-track', { ...getRoomAudioState(room), fadeInMs: 2200 });
+    schedulePlaylistEnd(roomId);
     console.log(`[Zen Pond] Special audio completed; playlist resumed: ${roomId}`);
     return true;
 }
@@ -505,6 +554,7 @@ function forceEndRoomSession(roomId, expectedSessionKey) {
     if (room.sessionKey !== expectedSessionKey || room.sessionClosed) return;
 
     room.sessionClosed = true;
+    schedulePlaylistEnd(rId);
     clearRoomSessionTimers(room);
     if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
     room.specialAudioEndTimer = null;
@@ -597,8 +647,10 @@ function applyRoomSession(roomId, sessionKey) {
     room.specialAudioTitle = '';
     room.specialAudioStartTime = 0;
     room.specialAudioDuration = 0;
+    resetShuffle(room);
     room.trackStartTime = Date.now();
     room.totalHearts = 0;
+    schedulePlaylistEnd(rId);
     Object.keys(room.lanternCounts).forEach(word => { room.lanternCounts[word] = 0; });
     io.to(rId).emit('session-counters-reset', {
         sessionKey: normalizedKey,
@@ -736,9 +788,15 @@ app.post('/admin/audio-control', (req, res) => {
         })).filter(item => /^https?:\/\//i.test(item.url));
         if (normalized.length) {
             const hadPlaylist = room.activePlaylist.length > 0;
+            const oldUrl = room.activePlaylist[room.currentTrackIndex]?.url;
+            const oldFingerprint = room.playlistFingerprint;
             room.activePlaylist = normalized;
             room.playlistFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
-            room.currentTrackIndex = Math.min(room.currentTrackIndex, normalized.length - 1);
+            if (room.playlistFingerprint !== oldFingerprint) {
+                const same = normalized.findIndex(item => item.url === oldUrl);
+                if (same >= 0) {room.currentTrackIndex = same;room.shuffleBag = shuffleIndices(normalized.length).filter(i => i !== same);}
+                else {resetShuffle(room);room.trackStartTime = Date.now();}
+            }
             if (!hadPlaylist) room.trackStartTime = Date.now();
         }
     }
@@ -750,10 +808,11 @@ app.post('/admin/audio-control', (req, res) => {
         })).filter(item => /^https?:\/\//i.test(item.url)) : [];
         if (!normalized.length) return res.status(400).json({ ok: false, message: 'Playlist is empty.' });
         room.activePlaylist = normalized;
+        room.trackDurations.clear();
         room.playlistFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
-        room.currentTrackIndex = 0;
+        resetShuffle(room);
         if (room.audioMode === 'special') {
-            room.specialInterruptedTrackIndex = 0;
+            room.specialInterruptedTrackIndex = room.currentTrackIndex;
         } else if (room.audioMode === 'paused') {
             room.audioResumeMode = 'playlist';
             room.audioPausedPosition = 0;
@@ -762,6 +821,7 @@ app.post('/admin/audio-control', (req, res) => {
             room.audioPaused = false;
             room.trackStartTime = Date.now();
             io.to(roomId).emit('sync-audio-track', { ...getRoomAudioState(room), fadeInMs: 1800 });
+            schedulePlaylistEnd(roomId);
         }
         console.log(`[Zen Pond] Admin updated playlist: ${roomId} (${normalized.length} tracks)`);
         return res.json({ ok: true, roomId, action });
@@ -776,7 +836,7 @@ app.post('/admin/audio-control', (req, res) => {
         if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
         room.specialAudioEndTimer = null;
         if (room.activePlaylist.length) {
-            room.currentTrackIndex = (Number(room.specialInterruptedTrackIndex || 0) + 1) % room.activePlaylist.length;
+            room.currentTrackIndex = nextShuffle(room);
         }
         room.trackStartTime = Date.now();
         room.audioResumeMode = 'playlist';
@@ -789,6 +849,7 @@ app.post('/admin/audio-control', (req, res) => {
         room.specialAudioStartTime = 0;
         room.specialAudioDuration = 0;
         io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 1200, audioState: getRoomAudioState(room) });
+        schedulePlaylistEnd(roomId);
         console.log(`[Zen Pond] Admin stopped special audio: ${roomId}`);
         return res.json({ ok: true, roomId, action });
     }
@@ -801,7 +862,7 @@ app.post('/admin/audio-control', (req, res) => {
                 if (room.specialAudioEndTimer) clearTimeout(room.specialAudioEndTimer);
                 room.specialAudioEndTimer = null;
                 if (room.activePlaylist.length) {
-                    room.currentTrackIndex = (Number(room.specialInterruptedTrackIndex || 0) + 1) % room.activePlaylist.length;
+                    room.currentTrackIndex = nextShuffle(room);
                 }
                 room.trackStartTime = Date.now();
                 room.audioResumeMode = 'playlist';
@@ -820,6 +881,7 @@ app.post('/admin/audio-control', (req, res) => {
             room.audioPaused = true;
         }
         io.to(roomId).emit('audio-pause', { roomId, fadeOutMs: 1600, audioState: getRoomAudioState(room) });
+        schedulePlaylistEnd(roomId);
         console.log(`[Zen Pond] Admin paused room audio: ${roomId}`);
         return res.json({ ok: true, roomId, action });
     }
@@ -836,6 +898,7 @@ app.post('/admin/audio-control', (req, res) => {
             } else room.trackStartTime = startTime;
         }
         io.to(roomId).emit('audio-resume', { roomId, audioState: getRoomAudioState(room), fadeInMs: 1800 });
+        schedulePlaylistEnd(roomId);
         console.log(`[Zen Pond] Admin resumed room audio: ${roomId}`);
         return res.json({ ok: true, roomId, action });
     }
@@ -854,6 +917,7 @@ app.post('/admin/audio-control', (req, res) => {
     room.specialAudioTitle = String(special.title || 'Audio đặc biệt').slice(0, 180);
     room.specialAudioStartTime = Date.now() + 1600;
     room.audioMode = 'special';
+    schedulePlaylistEnd(roomId);
     room.audioResumeMode = 'playlist';
     room.audioPaused = false;
     room.audioPausedPosition = 0;
@@ -1222,13 +1286,14 @@ io.on('connection', (socket) => {
             (currentRoom.audioMode === 'paused' && currentRoom.audioResumeMode === 'special');
         if (preservingAdminOverride) return;
 
-        currentRoom.currentTrackIndex = 0;
+        resetShuffle(currentRoom);
         // Bắt đầu mốc thời gian tại lúc playlist chuẩn được khởi tạo,
         // tránh tính nhầm thời gian từ lúc room object được tạo trước đó.
         currentRoom.trackStartTime = Date.now();
 
         // Phát trạng thái chuẩn ngay khi playlist đầu tiên được đăng ký.
         io.to(socket.roomId).emit('sync-audio-track', getRoomAudioState(currentRoom));
+        schedulePlaylistEnd(socket.roomId);
         console.log(`[Zen Pond] Audio playlist initialized: room '${socket.roomId}' (${normalizedPlaylist.length} tracks)`);
     });
 
@@ -1251,13 +1316,18 @@ io.on('connection', (socket) => {
         if (!Number.isInteger(endedIndex) || endedIndex !== currentRoom.currentTrackIndex) return;
         if (!Number.isFinite(endedStartTime) || endedStartTime !== Number(currentRoom.trackStartTime)) return;
 
-        const nextIndex = (currentRoom.currentTrackIndex + 1) % currentRoom.activePlaylist.length;
-        const nextTrack = currentRoom.activePlaylist[nextIndex];
-        if (!nextTrack || !nextTrack.url) return;
+        const duration=currentRoom.trackDurations.get(currentRoom.activePlaylist[endedIndex]?.url);
+        if(duration&&Date.now()<endedStartTime+duration*1000-1000)return;
+        advancePlaylist(socket.roomId,endedIndex,endedStartTime);
+    });
 
-        currentRoom.currentTrackIndex = nextIndex;
-        currentRoom.trackStartTime = Date.now();
-        io.to(socket.roomId).emit('sync-audio-track', { ...getRoomAudioState(currentRoom), fadeInMs: 0 });
+    socket.on('playlist-track-metadata',data=>{
+        if(socket.identityBlocked||!socket.roomEntryAccepted||!data||String(data.roomId)!==String(socket.roomId))return;
+        const room=getRoomData(socket.roomId),duration=Number(data.duration),index=Number(data.trackIndex),start=Number(data.trackStartTime);
+        if(room.sessionClosed||room.audioMode!=='playlist'||index!==room.currentTrackIndex||start!==Number(room.trackStartTime)||!Number.isFinite(duration)||duration<1||duration>21600)return;
+        const url=room.activePlaylist[index]?.url;if(!url||url!==data.url)return;
+        if(!room.trackDurations.has(url)){if(room.trackDurations.size>=50)room.trackDurations.clear();room.trackDurations.set(url,duration);}
+        schedulePlaylistEnd(socket.roomId);
     });
 
     socket.on('special-audio-metadata', (data) => {
@@ -1386,7 +1456,7 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Zen Pond Realtime Server v10.5.1 running on port ${PORT}`);
+    console.log(`Zen Pond Realtime Server v10.5.2 running on port ${PORT}`);
     if (!IDENTITY_SECRET) {
         console.error('[Zen Pond] Missing DZP_SOCKET_IDENTITY_SECRET. Account identity validation is disabled; seat claims will be rejected.');
     }
